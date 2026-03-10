@@ -17,8 +17,8 @@ checkpoints/
 *.ckpt
 *.safetensors
 
-# Local data / caches (datasets, logs, etc. if created)
+# Local data / caches (top-level datasets, logs, etc. if created)
 data/
-datasets/
+/datasets/
 *.log
 
