@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,1767 +13,1901 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Dataset tools utilities for LeRobotDataset.
-
-This module provides utilities for:
-- Deleting episodes from datasets
-- Splitting datasets into multiple smaller datasets
-- Adding/removing features from datasets
-- Merging datasets (wrapper around aggregate functionality)
-"""
-
+import concurrent.futures
+import contextlib
 import logging
 import shutil
+import tempfile
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import datasets
 import numpy as np
+import packaging.version
 import pandas as pd
+import PIL.Image
+import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
-from tqdm import tqdm
+import torch.utils
+from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub.errors import RevisionNotFoundError
 
-from lerobot.datasets.aggregate import aggregate_datasets
-from lerobot.datasets.compute_stats import aggregate_stats
-from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
+from lerobot.datasets.image_writer import AsyncImageWriter, write_image
 from lerobot.datasets.utils import (
-    DATA_DIR,
-    DEFAULT_CHUNK_SIZE,
-    DEFAULT_DATA_FILE_SIZE_IN_MB,
-    DEFAULT_DATA_PATH,
     DEFAULT_EPISODES_PATH,
-    get_parquet_file_size_in_mb,
+    DEFAULT_FEATURES,
+    DEFAULT_IMAGE_PATH,
+    INFO_PATH,
+    _validate_feature_names,
+    add_features,
+    check_delta_timestamps,
+    check_version_compatibility,
+    create_empty_dataset_info,
+    create_lerobot_dataset_card,
+    embed_images,
+    flatten_dict,
+    get_delta_indices,
+    get_file_size_in_mb,
+    get_hf_features_from_features,
+    get_safe_version,
+    hf_transform_to_torch,
+    is_valid_version,
     load_episodes,
+    load_info,
+    load_nested_dataset,
+    load_stats,
+    load_subtasks,
+    load_tasks,
     update_chunk_file_indices,
+    validate_episode_buffer,
+    validate_frame,
     write_info,
+    write_json,
     write_stats,
     write_tasks,
 )
-from lerobot.datasets.video_utils import encode_video_frames, get_video_info
-from lerobot.utils.constants import HF_LEROBOT_HOME, OBS_IMAGE
+from lerobot.datasets.video_utils import (
+    StreamingVideoEncoder,
+    VideoFrame,
+    concatenate_video_files,
+    decode_video_frames,
+    encode_video_frames,
+    get_safe_default_codec,
+    get_video_duration_in_s,
+    get_video_info,
+    resolve_vcodec,
+)
+from lerobot.utils.constants import HF_LEROBOT_HOME
+
+CODEBASE_VERSION = "v3.0"
 
 
-def _load_episode_with_stats(src_dataset: LeRobotDataset, episode_idx: int) -> dict:
-    """Load a single episode's metadata including stats from parquet file.
+class LeRobotDatasetMetadata:
+    def __init__(
+        self,
+        repo_id: str,
+        root: str | Path | None = None,
+        revision: str | None = None,
+        force_cache_sync: bool = False,
+        metadata_buffer_size: int = 10,
+    ):
+        self.repo_id = repo_id
+        self.revision = revision if revision else CODEBASE_VERSION
+        self.root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
+        self.writer = None
+        self.latest_episode = None
+        self.metadata_buffer: list[dict] = []
+        self.metadata_buffer_size = metadata_buffer_size
 
-    Args:
-        src_dataset: Source dataset
-        episode_idx: Episode index to load
+        try:
+            if force_cache_sync:
+                raise FileNotFoundError
+            self.load_metadata()
+        except (FileNotFoundError, NotADirectoryError) as e:
+            # Local-only dataset: when root was explicitly provided, do not call Hub.
+            if root is not None:
+                raise FileNotFoundError(
+                    f"Missing metadata under {self.root}. "
+                    "Create meta/tasks.parquet (and meta/tasks.jsonl for older LeRobot). "
+                    "Example: python ensure_lerobot_meta.py <repo_id_or_path>"
+                ) from e
+            if is_valid_version(self.revision):
+                self.revision = get_safe_version(self.repo_id, self.revision)
 
-    Returns:
-        dict containing episode metadata and stats
-    """
-    ep_meta = src_dataset.meta.episodes[episode_idx]
-    chunk_idx = ep_meta["meta/episodes/chunk_index"]
-    file_idx = ep_meta["meta/episodes/file_index"]
+            (self.root / "meta").mkdir(exist_ok=True, parents=True)
+            self.pull_from_repo(allow_patterns="meta/")
+            self.load_metadata()
 
-    parquet_path = src_dataset.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
-    df = pd.read_parquet(parquet_path)
+    def _flush_metadata_buffer(self) -> None:
+        """Write all buffered episode metadata to parquet file."""
+        if not hasattr(self, "metadata_buffer") or len(self.metadata_buffer) == 0:
+            return
 
-    episode_row = df[df["episode_index"] == episode_idx].iloc[0]
+        combined_dict = {}
+        for episode_dict in self.metadata_buffer:
+            for key, value in episode_dict.items():
+                if key not in combined_dict:
+                    combined_dict[key] = []
+                # Extract value and serialize numpy arrays
+                # because PyArrow's from_pydict function doesn't support numpy arrays
+                val = value[0] if isinstance(value, list) else value
+                combined_dict[key].append(val.tolist() if isinstance(val, np.ndarray) else val)
 
-    return episode_row.to_dict()
+        first_ep = self.metadata_buffer[0]
+        chunk_idx = first_ep["meta/episodes/chunk_index"][0]
+        file_idx = first_ep["meta/episodes/file_index"][0]
 
+        table = pa.Table.from_pydict(combined_dict)
 
-def delete_episodes(
-    dataset: LeRobotDataset,
-    episode_indices: list[int],
-    output_dir: str | Path | None = None,
-    repo_id: str | None = None,
-) -> LeRobotDataset:
-    """Delete episodes from a LeRobotDataset and create a new dataset.
+        if not self.writer:
+            path = Path(self.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.writer = pq.ParquetWriter(
+                path, schema=table.schema, compression="snappy", use_dictionary=True
+            )
 
-    Args:
-        dataset: The source LeRobotDataset.
-        episode_indices: List of episode indices to delete.
-        output_dir: Root directory where the edited dataset will be stored. If not specified, defaults to $HF_LEROBOT_HOME/repo_id. Equivalent to new_root in EditDatasetConfig.
-        repo_id: Edited dataset identifier. Equivalent to new_repo_id in EditDatasetConfig.
-    """
-    if not episode_indices:
-        raise ValueError("No episodes to delete")
+        self.writer.write_table(table)
 
-    valid_indices = set(range(dataset.meta.total_episodes))
-    invalid = set(episode_indices) - valid_indices
-    if invalid:
-        raise ValueError(f"Invalid episode indices: {invalid}")
+        self.latest_episode = self.metadata_buffer[-1]
+        self.metadata_buffer.clear()
 
-    logging.info(f"Deleting {len(episode_indices)} episodes from dataset")
+    def _close_writer(self) -> None:
+        """Close and cleanup the parquet writer if it exists."""
+        self._flush_metadata_buffer()
 
-    if repo_id is None:
-        repo_id = f"{dataset.repo_id}_modified"
-    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+        writer = getattr(self, "writer", None)
+        if writer is not None:
+            writer.close()
+            self.writer = None
 
-    episodes_to_keep = [i for i in range(dataset.meta.total_episodes) if i not in episode_indices]
-    if not episodes_to_keep:
-        raise ValueError("Cannot delete all episodes from dataset")
+    def __del__(self):
+        """
+        Trust the user to call .finalize() but as an added safety check call the parquet writer to stop when calling the destructor
+        """
+        self._close_writer()
 
-    new_meta = LeRobotDatasetMetadata.create(
-        repo_id=repo_id,
-        fps=dataset.meta.fps,
-        features=dataset.meta.features,
-        robot_type=dataset.meta.robot_type,
-        root=output_dir,
-        use_videos=len(dataset.meta.video_keys) > 0,
-    )
+    def load_metadata(self):
+        self.info = load_info(self.root)
+        check_version_compatibility(self.repo_id, self._version, CODEBASE_VERSION)
+        self.tasks = load_tasks(self.root)
+        self.subtasks = load_subtasks(self.root)
+        self.episodes = load_episodes(self.root)
+        self.stats = load_stats(self.root)
 
-    episode_mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(episodes_to_keep)}
-
-    video_metadata = None
-    if dataset.meta.video_keys:
-        video_metadata = _copy_and_reindex_videos(dataset, new_meta, episode_mapping)
-
-    data_metadata = _copy_and_reindex_data(dataset, new_meta, episode_mapping)
-
-    _copy_and_reindex_episodes_metadata(dataset, new_meta, episode_mapping, data_metadata, video_metadata)
-
-    new_dataset = LeRobotDataset(
-        repo_id=repo_id,
-        root=output_dir,
-        image_transforms=dataset.image_transforms,
-        delta_timestamps=dataset.delta_timestamps,
-        tolerance_s=dataset.tolerance_s,
-    )
-
-    logging.info(f"Created new dataset with {len(episodes_to_keep)} episodes")
-    return new_dataset
-
-
-def split_dataset(
-    dataset: LeRobotDataset,
-    splits: dict[str, float | list[int]],
-    output_dir: str | Path | None = None,
-) -> dict[str, LeRobotDataset]:
-    """Split a LeRobotDataset into multiple smaller datasets.
-
-    Args:
-        dataset: The source LeRobotDataset to split.
-        splits: Either a dict mapping split names to episode indices, or a dict mapping
-                split names to fractions (must sum to <= 1.0).
-        output_dir: Root directory where the split datasets will be stored. If not specified, defaults to $HF_LEROBOT_HOME/repo_id.
-
-    Examples:
-      Split by specific episodes
-        splits = {"train": [0, 1, 2], "val": [3, 4]}
-        datasets = split_dataset(dataset, splits)
-
-      Split by fractions
-        splits = {"train": 0.8, "val": 0.2}
-        datasets = split_dataset(dataset, splits)
-    """
-    if not splits:
-        raise ValueError("No splits provided")
-
-    if all(isinstance(v, float) for v in splits.values()):
-        splits = _fractions_to_episode_indices(dataset.meta.total_episodes, splits)
-
-    all_episodes = set()
-    for split_name, episodes in splits.items():
-        if not episodes:
-            raise ValueError(f"Split '{split_name}' has no episodes")
-        episode_set = set(episodes)
-        if episode_set & all_episodes:
-            raise ValueError("Episodes cannot appear in multiple splits")
-        all_episodes.update(episode_set)
-
-    valid_indices = set(range(dataset.meta.total_episodes))
-    invalid = all_episodes - valid_indices
-    if invalid:
-        raise ValueError(f"Invalid episode indices: {invalid}")
-
-    if output_dir is not None:
-        output_dir = Path(output_dir)
-
-    result_datasets = {}
-
-    for split_name, episodes in splits.items():
-        logging.info(f"Creating split '{split_name}' with {len(episodes)} episodes")
-
-        split_repo_id = f"{dataset.repo_id}_{split_name}"
-
-        split_output_dir = (
-            output_dir / split_name if output_dir is not None else HF_LEROBOT_HOME / split_repo_id
+    def pull_from_repo(
+        self,
+        allow_patterns: list[str] | str | None = None,
+        ignore_patterns: list[str] | str | None = None,
+    ) -> None:
+        snapshot_download(
+            self.repo_id,
+            repo_type="dataset",
+            revision=self.revision,
+            local_dir=self.root,
+            allow_patterns=allow_patterns,
+            ignore_patterns=ignore_patterns,
         )
 
-        episode_mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(sorted(episodes))}
-
-        new_meta = LeRobotDatasetMetadata.create(
-            repo_id=split_repo_id,
-            fps=dataset.meta.fps,
-            features=dataset.meta.features,
-            robot_type=dataset.meta.robot_type,
-            root=split_output_dir,
-            use_videos=len(dataset.meta.video_keys) > 0,
-            chunks_size=dataset.meta.chunks_size,
-            data_files_size_in_mb=dataset.meta.data_files_size_in_mb,
-            video_files_size_in_mb=dataset.meta.video_files_size_in_mb,
-        )
-
-        video_metadata = None
-        if dataset.meta.video_keys:
-            video_metadata = _copy_and_reindex_videos(dataset, new_meta, episode_mapping)
-
-        data_metadata = _copy_and_reindex_data(dataset, new_meta, episode_mapping)
-
-        _copy_and_reindex_episodes_metadata(dataset, new_meta, episode_mapping, data_metadata, video_metadata)
-
-        new_dataset = LeRobotDataset(
-            repo_id=split_repo_id,
-            root=split_output_dir,
-            image_transforms=dataset.image_transforms,
-            delta_timestamps=dataset.delta_timestamps,
-            tolerance_s=dataset.tolerance_s,
-        )
-
-        result_datasets[split_name] = new_dataset
-
-    return result_datasets
-
-
-def merge_datasets(
-    datasets: list[LeRobotDataset],
-    output_repo_id: str,
-    output_dir: str | Path | None = None,
-) -> LeRobotDataset:
-    """Merge multiple LeRobotDatasets into a single dataset.
-
-    This is a wrapper around the aggregate_datasets functionality with a cleaner API.
-
-    Args:
-        datasets: List of LeRobotDatasets to merge.
-        output_repo_id: Merged dataset identifier.
-        output_dir: Root directory where the merged dataset will be stored. If not specified, defaults to $HF_LEROBOT_HOME/output_repo_id.
-    """
-    if not datasets:
-        raise ValueError("No datasets to merge")
-
-    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / output_repo_id
-
-    repo_ids = [ds.repo_id for ds in datasets]
-    roots = [ds.root for ds in datasets]
-
-    aggregate_datasets(
-        repo_ids=repo_ids,
-        aggr_repo_id=output_repo_id,
-        roots=roots,
-        aggr_root=output_dir,
-    )
-
-    merged_dataset = LeRobotDataset(
-        repo_id=output_repo_id,
-        root=output_dir,
-        image_transforms=datasets[0].image_transforms,
-        delta_timestamps=datasets[0].delta_timestamps,
-        tolerance_s=datasets[0].tolerance_s,
-    )
-
-    return merged_dataset
-
-
-def modify_features(
-    dataset: LeRobotDataset,
-    add_features: dict[str, tuple[np.ndarray | torch.Tensor | Callable, dict]] | None = None,
-    remove_features: str | list[str] | None = None,
-    output_dir: str | Path | None = None,
-    repo_id: str | None = None,
-) -> LeRobotDataset:
-    """Modify a LeRobotDataset by adding and/or removing features in a single pass.
-
-    This is the most efficient way to modify features, as it only copies the dataset once
-    regardless of how many features are being added or removed.
-
-    Args:
-        dataset: The source LeRobotDataset.
-        add_features: Optional dict mapping feature names to (feature_values, feature_info) tuples.
-        remove_features: Optional feature name(s) to remove. Can be a single string or list.
-        output_dir: Root directory where the edited dataset will be stored. If not specified, defaults to $HF_LEROBOT_HOME/repo_id. Equivalent to new_root in EditDatasetConfig.
-        repo_id: Edited dataset identifier. Equivalent to new_repo_id in EditDatasetConfig.
-
-    Returns:
-        New dataset with features modified.
-
-    Example:
-        new_dataset = modify_features(
-            dataset,
-            add_features={
-                "reward": (reward_array, {"dtype": "float32", "shape": [1], "names": None}),
-            },
-            remove_features=["old_feature"],
-            output_dir="./output",
-        )
-    """
-    if add_features is None and remove_features is None:
-        raise ValueError("Must specify at least one of add_features or remove_features")
-
-    remove_features_list: list[str] = []
-    if remove_features is not None:
-        remove_features_list = [remove_features] if isinstance(remove_features, str) else remove_features
-
-    if add_features:
-        required_keys = {"dtype", "shape"}
-        for feature_name, (_, feature_info) in add_features.items():
-            if feature_name in dataset.meta.features:
-                raise ValueError(f"Feature '{feature_name}' already exists in dataset")
-
-            if not required_keys.issubset(feature_info.keys()):
-                raise ValueError(f"feature_info for '{feature_name}' must contain keys: {required_keys}")
-
-    if remove_features_list:
-        for name in remove_features_list:
-            if name not in dataset.meta.features:
-                raise ValueError(f"Feature '{name}' not found in dataset")
-
-        required_features = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
-        if any(name in required_features for name in remove_features_list):
-            raise ValueError(f"Cannot remove required features: {required_features}")
-
-    if repo_id is None:
-        repo_id = f"{dataset.repo_id}_modified"
-    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
-
-    new_features = dataset.meta.features.copy()
-
-    if remove_features_list:
-        for name in remove_features_list:
-            new_features.pop(name, None)
-
-    if add_features:
-        for feature_name, (_, feature_info) in add_features.items():
-            new_features[feature_name] = feature_info
-
-    video_keys_to_remove = [name for name in remove_features_list if name in dataset.meta.video_keys]
-    remaining_video_keys = [k for k in dataset.meta.video_keys if k not in video_keys_to_remove]
-
-    new_meta = LeRobotDatasetMetadata.create(
-        repo_id=repo_id,
-        fps=dataset.meta.fps,
-        features=new_features,
-        robot_type=dataset.meta.robot_type,
-        root=output_dir,
-        use_videos=len(remaining_video_keys) > 0,
-    )
-
-    _copy_data_with_feature_changes(
-        dataset=dataset,
-        new_meta=new_meta,
-        add_features=add_features,
-        remove_features=remove_features_list if remove_features_list else None,
-    )
-
-    if new_meta.video_keys:
-        _copy_videos(dataset, new_meta, exclude_keys=video_keys_to_remove if video_keys_to_remove else None)
-
-    new_dataset = LeRobotDataset(
-        repo_id=repo_id,
-        root=output_dir,
-        image_transforms=dataset.image_transforms,
-        delta_timestamps=dataset.delta_timestamps,
-        tolerance_s=dataset.tolerance_s,
-    )
-
-    return new_dataset
-
-
-def add_features(
-    dataset: LeRobotDataset,
-    features: dict[str, tuple[np.ndarray | torch.Tensor | Callable, dict]],
-    output_dir: str | Path | None = None,
-    repo_id: str | None = None,
-) -> LeRobotDataset:
-    """Add multiple features to a LeRobotDataset in a single pass.
-
-    This is more efficient than calling add_feature() multiple times, as it only
-    copies the dataset once regardless of how many features are being added.
-
-    Args:
-        dataset: The source LeRobotDataset.
-        features: Dictionary mapping feature names to (feature_values, feature_info) tuples.
-        output_dir: Root directory where the edited dataset will be stored. If not specified, defaults to $HF_LEROBOT_HOME/repo_id. Equivalent to new_root in EditDatasetConfig.
-        repo_id: Edited dataset identifier. Equivalent to new_repo_id in EditDatasetConfig.
-
-    Returns:
-        New dataset with all features added.
-
-    Example:
-        features = {
-            "task_embedding": (task_emb_array, {"dtype": "float32", "shape": [384], "names": None}),
-            "cam1_embedding": (cam1_emb_array, {"dtype": "float32", "shape": [768], "names": None}),
-            "cam2_embedding": (cam2_emb_array, {"dtype": "float32", "shape": [768], "names": None}),
-        }
-        new_dataset = add_features(dataset, features, output_dir="./output", repo_id="my_dataset")
-    """
-    if not features:
-        raise ValueError("No features provided")
-
-    return modify_features(
-        dataset=dataset,
-        add_features=features,
-        remove_features=None,
-        output_dir=output_dir,
-        repo_id=repo_id,
-    )
-
-
-def remove_feature(
-    dataset: LeRobotDataset,
-    feature_names: str | list[str],
-    output_dir: str | Path | None = None,
-    repo_id: str | None = None,
-) -> LeRobotDataset:
-    """Remove features from a LeRobotDataset.
-
-    Args:
-        dataset: The source LeRobotDataset.
-        feature_names: Name(s) of features to remove. Can be a single string or list.
-        output_dir: Root directory where the edited dataset will be stored. If not specified, defaults to $HF_LEROBOT_HOME/repo_id. Equivalent to new_root in EditDatasetConfig.
-        repo_id: Edited dataset identifier. Equivalent to new_repo_id in EditDatasetConfig.
-
-    Returns:
-        New dataset with features removed.
-    """
-    return modify_features(
-        dataset=dataset,
-        add_features=None,
-        remove_features=feature_names,
-        output_dir=output_dir,
-        repo_id=repo_id,
-    )
-
-
-def _fractions_to_episode_indices(
-    total_episodes: int,
-    splits: dict[str, float],
-) -> dict[str, list[int]]:
-    """Convert split fractions to episode indices."""
-    if sum(splits.values()) > 1.0:
-        raise ValueError("Split fractions must sum to <= 1.0")
-
-    indices = list(range(total_episodes))
-    result = {}
-    start_idx = 0
-
-    for split_name, fraction in splits.items():
-        num_episodes = int(total_episodes * fraction)
-        if num_episodes == 0:
-            logging.warning(f"Split '{split_name}' has no episodes, skipping...")
-            continue
-        end_idx = start_idx + num_episodes
-        if split_name == list(splits.keys())[-1]:
-            end_idx = total_episodes
-        result[split_name] = indices[start_idx:end_idx]
-        start_idx = end_idx
-
-    return result
-
-
-def _copy_and_reindex_data(
-    src_dataset: LeRobotDataset,
-    dst_meta: LeRobotDatasetMetadata,
-    episode_mapping: dict[int, int],
-) -> dict[int, dict]:
-    """Copy and filter data files, only modifying files with deleted episodes.
-
-    Args:
-        src_dataset: Source dataset to copy from
-        dst_meta: Destination metadata object
-        episode_mapping: Mapping from old episode indices to new indices
-
-    Returns:
-        dict mapping episode index to its data file metadata (chunk_index, file_index, etc.)
-    """
-    if src_dataset.meta.episodes is None:
-        src_dataset.meta.episodes = load_episodes(src_dataset.meta.root)
-
-    file_to_episodes: dict[Path, set[int]] = {}
-    for old_idx in episode_mapping:
-        file_path = src_dataset.meta.get_data_file_path(old_idx)
-        if file_path not in file_to_episodes:
-            file_to_episodes[file_path] = set()
-        file_to_episodes[file_path].add(old_idx)
-
-    global_index = 0
-    episode_data_metadata: dict[int, dict] = {}
-
-    if dst_meta.tasks is None:
-        all_task_indices = set()
-        for src_path in file_to_episodes:
-            df = pd.read_parquet(src_dataset.root / src_path)
-            mask = df["episode_index"].isin(list(episode_mapping.keys()))
-            task_series: pd.Series = df[mask]["task_index"]
-            all_task_indices.update(task_series.unique().tolist())
-        tasks = [src_dataset.meta.tasks.iloc[idx].name for idx in all_task_indices]
-        dst_meta.save_episode_tasks(list(set(tasks)))
-
-    task_mapping = {}
-    for old_task_idx in range(len(src_dataset.meta.tasks)):
-        task_name = src_dataset.meta.tasks.iloc[old_task_idx].name
-        new_task_idx = dst_meta.get_task_index(task_name)
-        if new_task_idx is not None:
-            task_mapping[old_task_idx] = new_task_idx
-
-    for src_path in tqdm(sorted(file_to_episodes.keys()), desc="Processing data files"):
-        df = pd.read_parquet(src_dataset.root / src_path)
-
-        all_episodes_in_file = set(df["episode_index"].unique())
-        episodes_to_keep = file_to_episodes[src_path]
-
-        if all_episodes_in_file == episodes_to_keep:
-            df["episode_index"] = df["episode_index"].replace(episode_mapping)
-            df["index"] = range(global_index, global_index + len(df))
-            df["task_index"] = df["task_index"].replace(task_mapping)
-
-            first_ep_old_idx = min(episodes_to_keep)
-            src_ep = src_dataset.meta.episodes[first_ep_old_idx]
-            chunk_idx = src_ep["data/chunk_index"]
-            file_idx = src_ep["data/file_index"]
+    @property
+    def url_root(self) -> str:
+        return f"hf://datasets/{self.repo_id}"
+
+    @property
+    def _version(self) -> packaging.version.Version:
+        """Codebase version used to create this dataset."""
+        return packaging.version.parse(self.info["codebase_version"])
+
+    def get_data_file_path(self, ep_index: int) -> Path:
+        if self.episodes is None:
+            self.episodes = load_episodes(self.root)
+        if ep_index >= len(self.episodes):
+            raise IndexError(
+                f"Episode index {ep_index} out of range. Episodes: {len(self.episodes) if self.episodes else 0}"
+            )
+        ep = self.episodes[ep_index]
+        chunk_idx = ep["data/chunk_index"]
+        file_idx = ep["data/file_index"]
+        fpath = self.data_path.format(chunk_index=chunk_idx, file_index=file_idx)
+        return Path(fpath)
+
+    def get_video_file_path(self, ep_index: int, vid_key: str) -> Path:
+        if self.episodes is None:
+            self.episodes = load_episodes(self.root)
+        if ep_index >= len(self.episodes):
+            raise IndexError(
+                f"Episode index {ep_index} out of range. Episodes: {len(self.episodes) if self.episodes else 0}"
+            )
+        ep = self.episodes[ep_index]
+        chunk_idx = ep[f"videos/{vid_key}/chunk_index"]
+        file_idx = ep[f"videos/{vid_key}/file_index"]
+        fpath = self.video_path.format(video_key=vid_key, chunk_index=chunk_idx, file_index=file_idx)
+        return Path(fpath)
+
+    @property
+    def data_path(self) -> str:
+        """Formattable string for the parquet files."""
+        return self.info["data_path"]
+
+    @property
+    def video_path(self) -> str | None:
+        """Formattable string for the video files."""
+        return self.info["video_path"]
+
+    @property
+    def robot_type(self) -> str | None:
+        """Robot type used in recording this dataset."""
+        return self.info["robot_type"]
+
+    @property
+    def fps(self) -> int:
+        """Frames per second used during data collection."""
+        return self.info["fps"]
+
+    @property
+    def features(self) -> dict[str, dict]:
+        """All features contained in the dataset."""
+        return self.info["features"]
+
+    @property
+    def image_keys(self) -> list[str]:
+        """Keys to access visual modalities stored as images."""
+        return [key for key, ft in self.features.items() if ft["dtype"] == "image"]
+
+    @property
+    def video_keys(self) -> list[str]:
+        """Keys to access visual modalities stored as videos."""
+        return [key for key, ft in self.features.items() if ft["dtype"] == "video"]
+
+    @property
+    def camera_keys(self) -> list[str]:
+        """Keys to access visual modalities (regardless of their storage method)."""
+        return [key for key, ft in self.features.items() if ft["dtype"] in ["video", "image"]]
+
+    @property
+    def names(self) -> dict[str, list | dict]:
+        """Names of the various dimensions of vector modalities."""
+        return {key: ft["names"] for key, ft in self.features.items()}
+
+    @property
+    def shapes(self) -> dict:
+        """Shapes for the different features."""
+        return {key: tuple(ft["shape"]) for key, ft in self.features.items()}
+
+    @property
+    def total_episodes(self) -> int:
+        """Total number of episodes available."""
+        return self.info["total_episodes"]
+
+    @property
+    def total_frames(self) -> int:
+        """Total number of frames saved in this dataset."""
+        return self.info["total_frames"]
+
+    @property
+    def total_tasks(self) -> int:
+        """Total number of different tasks performed in this dataset."""
+        return self.info["total_tasks"]
+
+    @property
+    def chunks_size(self) -> int:
+        """Max number of files per chunk."""
+        return self.info["chunks_size"]
+
+    @property
+    def data_files_size_in_mb(self) -> int:
+        """Max size of data file in mega bytes."""
+        return self.info["data_files_size_in_mb"]
+
+    @property
+    def video_files_size_in_mb(self) -> int:
+        """Max size of video file in mega bytes."""
+        return self.info["video_files_size_in_mb"]
+
+    def get_task_index(self, task: str) -> int | None:
+        """
+        Given a task in natural language, returns its task_index if the task already exists in the dataset,
+        otherwise return None.
+        """
+        if task in self.tasks.index:
+            return int(self.tasks.loc[task].task_index)
         else:
-            mask = df["episode_index"].isin(list(episode_mapping.keys()))
-            df = df[mask].copy().reset_index(drop=True)
+            return None
 
-            if len(df) == 0:
-                continue
+    def save_episode_tasks(self, tasks: list[str]):
+        if len(set(tasks)) != len(tasks):
+            raise ValueError(f"Tasks are not unique: {tasks}")
 
-            df["episode_index"] = df["episode_index"].replace(episode_mapping)
-            df["index"] = range(global_index, global_index + len(df))
-            df["task_index"] = df["task_index"].replace(task_mapping)
+        if self.tasks is None:
+            new_tasks = tasks
+            task_indices = range(len(tasks))
+            self.tasks = pd.DataFrame({"task_index": task_indices}, index=pd.Index(tasks, name="task"))
+        else:
+            new_tasks = [task for task in tasks if task not in self.tasks.index]
+            new_task_indices = range(len(self.tasks), len(self.tasks) + len(new_tasks))
+            for task_idx, task in zip(new_task_indices, new_tasks, strict=False):
+                self.tasks.loc[task] = task_idx
 
-            first_ep_old_idx = min(episodes_to_keep)
-            src_ep = src_dataset.meta.episodes[first_ep_old_idx]
-            chunk_idx = src_ep["data/chunk_index"]
-            file_idx = src_ep["data/file_index"]
+        if len(new_tasks) > 0:
+            # Update on disk
+            write_tasks(self.tasks, self.root)
 
-        dst_path = dst_meta.root / DEFAULT_DATA_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
-        dst_path.parent.mkdir(parents=True, exist_ok=True)
+    def _save_episode_metadata(self, episode_dict: dict) -> None:
+        """Buffer episode metadata and write to parquet in batches for efficiency.
 
-        _write_parquet(df, dst_path, dst_meta)
+        This function accumulates episode metadata in a buffer and flushes it when the buffer
+        reaches the configured size. This reduces I/O overhead by writing multiple episodes
+        at once instead of one row at a time.
 
-        for ep_old_idx in episodes_to_keep:
-            ep_new_idx = episode_mapping[ep_old_idx]
-            ep_df = df[df["episode_index"] == ep_new_idx]
-            episode_data_metadata[ep_new_idx] = {
-                "data/chunk_index": chunk_idx,
-                "data/file_index": file_idx,
-                "dataset_from_index": int(ep_df["index"].min()),
-                "dataset_to_index": int(ep_df["index"].max() + 1),
+        Notes: We both need to update parquet files and HF dataset:
+        - `pandas` loads parquet file in RAM
+        - `datasets` relies on a memory mapping from pyarrow (no RAM). It either converts parquet files to a pyarrow cache on disk,
+          or loads directly from pyarrow cache.
+        """
+        # Convert to list format for each value
+        episode_dict = {key: [value] for key, value in episode_dict.items()}
+        num_frames = episode_dict["length"][0]
+
+        if self.latest_episode is None:
+            # Initialize indices and frame count for a new dataset made of the first episode data
+            chunk_idx, file_idx = 0, 0
+            if self.episodes is not None and len(self.episodes) > 0:
+                # It means we are resuming recording, so we need to load the latest episode
+                # Update the indices to avoid overwriting the latest episode
+                chunk_idx = self.episodes[-1]["meta/episodes/chunk_index"]
+                file_idx = self.episodes[-1]["meta/episodes/file_index"]
+                latest_num_frames = self.episodes[-1]["dataset_to_index"]
+                episode_dict["dataset_from_index"] = [latest_num_frames]
+                episode_dict["dataset_to_index"] = [latest_num_frames + num_frames]
+
+                # When resuming, move to the next file
+                chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, self.chunks_size)
+            else:
+                episode_dict["dataset_from_index"] = [0]
+                episode_dict["dataset_to_index"] = [num_frames]
+
+            episode_dict["meta/episodes/chunk_index"] = [chunk_idx]
+            episode_dict["meta/episodes/file_index"] = [file_idx]
+        else:
+            chunk_idx = self.latest_episode["meta/episodes/chunk_index"][0]
+            file_idx = self.latest_episode["meta/episodes/file_index"][0]
+
+            latest_path = (
+                self.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
+                if self.writer is None
+                else self.writer.where
+            )
+
+            if Path(latest_path).exists():
+                latest_size_in_mb = get_file_size_in_mb(Path(latest_path))
+                latest_num_frames = self.latest_episode["episode_index"][0]
+
+                av_size_per_frame = latest_size_in_mb / latest_num_frames if latest_num_frames > 0 else 0.0
+
+                if latest_size_in_mb + av_size_per_frame * num_frames >= self.data_files_size_in_mb:
+                    # Size limit is reached, flush buffer and prepare new parquet file
+                    self._flush_metadata_buffer()
+                    chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, self.chunks_size)
+                    self._close_writer()
+
+            # Update the existing pandas dataframe with new row
+            episode_dict["meta/episodes/chunk_index"] = [chunk_idx]
+            episode_dict["meta/episodes/file_index"] = [file_idx]
+            episode_dict["dataset_from_index"] = [self.latest_episode["dataset_to_index"][0]]
+            episode_dict["dataset_to_index"] = [self.latest_episode["dataset_to_index"][0] + num_frames]
+
+        # Add to buffer
+        self.metadata_buffer.append(episode_dict)
+        self.latest_episode = episode_dict
+
+        if len(self.metadata_buffer) >= self.metadata_buffer_size:
+            self._flush_metadata_buffer()
+
+    def save_episode(
+        self,
+        episode_index: int,
+        episode_length: int,
+        episode_tasks: list[str],
+        episode_stats: dict[str, dict],
+        episode_metadata: dict,
+    ) -> None:
+        episode_dict = {
+            "episode_index": episode_index,
+            "tasks": episode_tasks,
+            "length": episode_length,
+        }
+        episode_dict.update(episode_metadata)
+        episode_dict.update(flatten_dict({"stats": episode_stats}))
+        self._save_episode_metadata(episode_dict)
+
+        # Update info
+        self.info["total_episodes"] += 1
+        self.info["total_frames"] += episode_length
+        self.info["total_tasks"] = len(self.tasks)
+        self.info["splits"] = {"train": f"0:{self.info['total_episodes']}"}
+
+        write_info(self.info, self.root)
+
+        self.stats = aggregate_stats([self.stats, episode_stats]) if self.stats is not None else episode_stats
+        write_stats(self.stats, self.root)
+
+    def update_video_info(self, video_key: str | None = None) -> None:
+        """
+        Warning: this function writes info from first episode videos, implicitly assuming that all videos have
+        been encoded the same way. Also, this means it assumes the first episode exists.
+        """
+        if video_key is not None and video_key not in self.video_keys:
+            raise ValueError(f"Video key {video_key} not found in dataset")
+
+        video_keys = [video_key] if video_key is not None else self.video_keys
+        for key in video_keys:
+            if not self.features[key].get("info", None):
+                video_path = self.root / self.video_path.format(video_key=key, chunk_index=0, file_index=0)
+                self.info["features"][key]["info"] = get_video_info(video_path)
+
+    def update_chunk_settings(
+        self,
+        chunks_size: int | None = None,
+        data_files_size_in_mb: int | None = None,
+        video_files_size_in_mb: int | None = None,
+    ) -> None:
+        """Update chunk and file size settings after dataset creation.
+
+        This allows users to customize storage organization without modifying the constructor.
+        These settings control how episodes are chunked and how large files can grow before
+        creating new ones.
+
+        Args:
+            chunks_size: Maximum number of files per chunk directory. If None, keeps current value.
+            data_files_size_in_mb: Maximum size for data parquet files in MB. If None, keeps current value.
+            video_files_size_in_mb: Maximum size for video files in MB. If None, keeps current value.
+        """
+        if chunks_size is not None:
+            if chunks_size <= 0:
+                raise ValueError(f"chunks_size must be positive, got {chunks_size}")
+            self.info["chunks_size"] = chunks_size
+
+        if data_files_size_in_mb is not None:
+            if data_files_size_in_mb <= 0:
+                raise ValueError(f"data_files_size_in_mb must be positive, got {data_files_size_in_mb}")
+            self.info["data_files_size_in_mb"] = data_files_size_in_mb
+
+        if video_files_size_in_mb is not None:
+            if video_files_size_in_mb <= 0:
+                raise ValueError(f"video_files_size_in_mb must be positive, got {video_files_size_in_mb}")
+            self.info["video_files_size_in_mb"] = video_files_size_in_mb
+
+        # Update the info file on disk
+        write_info(self.info, self.root)
+
+    def get_chunk_settings(self) -> dict[str, int]:
+        """Get current chunk and file size settings.
+
+        Returns:
+            Dict containing chunks_size, data_files_size_in_mb, and video_files_size_in_mb.
+        """
+        return {
+            "chunks_size": self.chunks_size,
+            "data_files_size_in_mb": self.data_files_size_in_mb,
+            "video_files_size_in_mb": self.video_files_size_in_mb,
+        }
+
+    def __repr__(self):
+        feature_keys = list(self.features)
+        return (
+            f"{self.__class__.__name__}({{\n"
+            f"    Repository ID: '{self.repo_id}',\n"
+            f"    Total episodes: '{self.total_episodes}',\n"
+            f"    Total frames: '{self.total_frames}',\n"
+            f"    Features: '{feature_keys}',\n"
+            "})',\n"
+        )
+
+    @classmethod
+    def create(
+        cls,
+        repo_id: str,
+        fps: int,
+        features: dict,
+        robot_type: str | None = None,
+        root: str | Path | None = None,
+        use_videos: bool = True,
+        metadata_buffer_size: int = 10,
+        chunks_size: int | None = None,
+        data_files_size_in_mb: int | None = None,
+        video_files_size_in_mb: int | None = None,
+    ) -> "LeRobotDatasetMetadata":
+        """Creates metadata for a LeRobotDataset."""
+        obj = cls.__new__(cls)
+        obj.repo_id = repo_id
+        obj.root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
+
+        obj.root.mkdir(parents=True, exist_ok=True)
+
+        features = {**features, **DEFAULT_FEATURES}
+        _validate_feature_names(features)
+
+        obj.tasks = None
+        obj.subtasks = None
+        obj.episodes = None
+        obj.stats = None
+        obj.info = create_empty_dataset_info(
+            CODEBASE_VERSION,
+            fps,
+            features,
+            use_videos,
+            robot_type,
+            chunks_size,
+            data_files_size_in_mb,
+            video_files_size_in_mb,
+        )
+        if len(obj.video_keys) > 0 and not use_videos:
+            raise ValueError()
+        write_json(obj.info, obj.root / INFO_PATH)
+        obj.revision = None
+        obj.writer = None
+        obj.latest_episode = None
+        obj.metadata_buffer = []
+        obj.metadata_buffer_size = metadata_buffer_size
+        return obj
+
+
+def _encode_video_worker(
+    video_key: str,
+    episode_index: int,
+    root: Path,
+    fps: int,
+    vcodec: str = "libsvtav1",
+    encoder_threads: int | None = None,
+) -> Path:
+    temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
+    fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=episode_index, frame_index=0)
+    img_dir = (root / fpath).parent
+    encode_video_frames(
+        img_dir, temp_path, fps, vcodec=vcodec, overwrite=True, encoder_threads=encoder_threads
+    )
+    shutil.rmtree(img_dir)
+    return temp_path
+
+
+class LeRobotDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        repo_id: str,
+        root: str | Path | None = None,
+        episodes: list[int] | None = None,
+        image_transforms: Callable | None = None,
+        delta_timestamps: dict[str, list[float]] | None = None,
+        tolerance_s: float = 1e-4,
+        revision: str | None = None,
+        force_cache_sync: bool = False,
+        download_videos: bool = True,
+        video_backend: str | None = None,
+        batch_encoding_size: int = 1,
+        vcodec: str = "libsvtav1",
+        streaming_encoding: bool = False,
+        encoder_queue_maxsize: int = 30,
+        encoder_threads: int | None = None,
+    ):
+        """
+        2 modes are available for instantiating this class, depending on 2 different use cases:
+
+        1. Your dataset already exists:
+            - On your local disk in the 'root' folder. This is typically the case when you recorded your
+              dataset locally and you may or may not have pushed it to the hub yet. Instantiating this class
+              with 'root' will load your dataset directly from disk. This can happen while you're offline (no
+              internet connection).
+
+            - On the Hugging Face Hub at the address https://huggingface.co/datasets/{repo_id} and not on
+              your local disk in the 'root' folder. Instantiating this class with this 'repo_id' will download
+              the dataset from that address and load it, pending your dataset is compliant with
+              codebase_version v3.0. If your dataset has been created before this new format, you will be
+              prompted to convert it using our conversion script from v2.1 to v3.0, which you can find at
+              lerobot/datasets/v30/convert_dataset_v21_to_v30.py.
+
+
+        2. Your dataset doesn't already exists (either on local disk or on the Hub): you can create an empty
+           LeRobotDataset with the 'create' classmethod. This can be used for recording a dataset or port an
+           existing dataset to the LeRobotDataset format.
+
+
+        In terms of files, LeRobotDataset encapsulates 3 main things:
+            - metadata:
+                - info contains various information about the dataset like shapes, keys, fps etc.
+                - stats stores the dataset statistics of the different modalities for normalization
+                - tasks contains the prompts for each task of the dataset, which can be used for
+                  task-conditioned training.
+            - hf_dataset (from datasets.Dataset), which will read any values from parquet files.
+            - videos (optional) from which frames are loaded to be synchronous with data from parquet files.
+
+        A typical LeRobotDataset looks like this from its root path:
+        .
+        ├── data
+        │   ├── chunk-000
+        │   │   ├── file-000.parquet
+        │   │   ├── file-001.parquet
+        │   │   └── ...
+        │   ├── chunk-001
+        │   │   ├── file-000.parquet
+        │   │   ├── file-001.parquet
+        │   │   └── ...
+        │   └── ...
+        ├── meta
+        │   ├── episodes
+        │   │   ├── chunk-000
+        │   │   │   ├── file-000.parquet
+        │   │   │   ├── file-001.parquet
+        │   │   │   └── ...
+        │   │   ├── chunk-001
+        │   │   │   └── ...
+        │   │   └── ...
+        │   ├── info.json
+        │   ├── stats.json
+        │   └── tasks.parquet
+        └── videos
+            ├── observation.images.laptop
+            │   ├── chunk-000
+            │   │   ├── file-000.mp4
+            │   │   ├── file-001.mp4
+            │   │   └── ...
+            │   ├── chunk-001
+            │   │   └── ...
+            │   └── ...
+            ├── observation.images.phone
+            │   ├── chunk-000
+            │   │   ├── file-000.mp4
+            │   │   ├── file-001.mp4
+            │   │   └── ...
+            │   ├── chunk-001
+            │   │   └── ...
+            │   └── ...
+            └── ...
+
+        Note that this file-based structure is designed to be as versatile as possible. Multiple episodes are
+        consolidated into chunked files which improves storage efficiency and loading performance. The
+        structure of the dataset is entirely described in the info.json file, which can be easily downloaded
+        or viewed directly on the hub before downloading any actual data. The type of files used are very
+        simple and do not need complex tools to be read, it only uses .parquet, .json and .mp4 files (and .md
+        for the README).
+
+        Args:
+            repo_id (str): This is the repo id that will be used to fetch the dataset.
+            root (Path | None, optional): Local directory where the dataset will be downloaded and
+                stored. If set, all dataset files will be stored directly under this path. If not set, the
+                dataset files will be stored under $HF_LEROBOT_HOME/repo_id (configurable via the
+                HF_LEROBOT_HOME environment variable).
+            episodes (list[int] | None, optional): If specified, this will only load episodes specified by
+                their episode_index in this list. Defaults to None.
+            image_transforms (Callable | None, optional): You can pass standard v2 image transforms from
+                torchvision.transforms.v2 here which will be applied to visual modalities (whether they come
+                from videos or images). Defaults to None.
+            delta_timestamps (dict[list[float]] | None, optional): _description_. Defaults to None.
+            tolerance_s (float, optional): Tolerance in seconds used to ensure data timestamps are actually in
+                sync with the fps value. It is used at the init of the dataset to make sure that each
+                timestamps is separated to the next by 1/fps +/- tolerance_s. This also applies to frames
+                decoded from video files. It is also used to check that `delta_timestamps` (when provided) are
+                multiples of 1/fps. Defaults to 1e-4.
+            revision (str, optional): An optional Git revision id which can be a branch name, a tag, or a
+                commit hash. Defaults to current codebase version tag.
+            force_cache_sync (bool, optional): Flag to sync and refresh local files first. If True and files
+                are already present in the local cache, this will be faster. However, files loaded might not
+                be in sync with the version on the hub, especially if you specified 'revision'. Defaults to
+                False.
+            download_videos (bool, optional): Flag to download the videos. Note that when set to True but the
+                video files are already present on local disk, they won't be downloaded again. Defaults to
+                True.
+            video_backend (str | None, optional): Video backend to use for decoding videos. Defaults to torchcodec when available int the platform; otherwise, defaults to 'pyav'.
+                You can also use the 'pyav' decoder used by Torchvision, which used to be the default option, or 'video_reader' which is another decoder of Torchvision.
+            batch_encoding_size (int, optional): Number of episodes to accumulate before batch encoding videos.
+                Set to 1 for immediate encoding (default), or higher for batched encoding. Defaults to 1.
+            vcodec (str, optional): Video codec for encoding videos during recording. Options: 'h264', 'hevc',
+                'libsvtav1', 'auto', or hardware-specific codecs like 'h264_videotoolbox', 'h264_nvenc'.
+                Defaults to 'libsvtav1'. Use 'auto' to auto-detect the best available hardware encoder.
+            streaming_encoding (bool, optional): If True, encode video frames in real-time during capture
+                instead of writing PNG images first. This makes save_episode() near-instant. Defaults to False.
+            encoder_queue_maxsize (int, optional): Maximum number of frames to buffer per camera when using
+                streaming encoding. Defaults to 30 (~1s at 30fps).
+            encoder_threads (int | None, optional): Number of threads per encoder instance. None lets the
+                codec auto-detect (default). Lower values reduce CPU usage per encoder. Maps to 'lp' (via svtav1-params) for
+                libsvtav1 and 'threads' for h264/hevc.
+        """
+        super().__init__()
+        self.repo_id = repo_id
+        self.root = Path(root) if root else HF_LEROBOT_HOME / repo_id
+        self.image_transforms = image_transforms
+        self.delta_timestamps = delta_timestamps
+        self.episodes = episodes
+        self.tolerance_s = tolerance_s
+        self.revision = revision if revision else CODEBASE_VERSION
+        self.video_backend = video_backend if video_backend else get_safe_default_codec()
+        self.delta_indices = None
+        self.batch_encoding_size = batch_encoding_size
+        self.episodes_since_last_encoding = 0
+        self.vcodec = resolve_vcodec(vcodec)
+        self._encoder_threads = encoder_threads
+
+        # Unused attributes
+        self.image_writer = None
+        self.episode_buffer = None
+        self.writer = None
+        self.latest_episode = None
+        self._current_file_start_frame = None  # Track the starting frame index of the current parquet file
+        self._streaming_encoder = None
+
+        self.root.mkdir(exist_ok=True, parents=True)
+
+        # Load metadata
+        self.meta = LeRobotDatasetMetadata(
+            self.repo_id, self.root, self.revision, force_cache_sync=force_cache_sync
+        )
+
+        # Track dataset state for efficient incremental writing
+        self._lazy_loading = False
+        self._recorded_frames = self.meta.total_frames
+        self._writer_closed_for_reading = False
+
+        # Load actual data
+        try:
+            if force_cache_sync:
+                raise FileNotFoundError
+            self.hf_dataset = self.load_hf_dataset()
+            # Check if cached dataset contains all requested episodes
+            if not self._check_cached_episodes_sufficient():
+                raise FileNotFoundError("Cached dataset doesn't contain all requested episodes")
+        except (FileNotFoundError, NotADirectoryError) as e:
+            if root is not None:
+                raise FileNotFoundError(
+                    f"Local dataset under {self.root} is missing data or meta. "
+                    "Ensure meta/ (e.g. tasks.parquet or tasks.jsonl) and data/ exist."
+                ) from e
+            if is_valid_version(self.revision):
+                self.revision = get_safe_version(self.repo_id, self.revision)
+            self.download(download_videos)
+            self.hf_dataset = self.load_hf_dataset()
+
+        # Create mapping from absolute indices to relative indices when only a subset of the episodes are loaded
+        # Build a mapping: absolute_index -> relative_index_in_filtered_dataset
+        self._absolute_to_relative_idx = None
+        if self.episodes is not None:
+            self._absolute_to_relative_idx = {
+                abs_idx.item() if isinstance(abs_idx, torch.Tensor) else abs_idx: rel_idx
+                for rel_idx, abs_idx in enumerate(self.hf_dataset["index"])
             }
 
-        global_index += len(df)
+        # Setup delta_indices
+        if self.delta_timestamps is not None:
+            check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
+            self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
 
-    return episode_data_metadata
+        # Initialize streaming encoder for resumed recording
+        if streaming_encoding and len(self.meta.video_keys) > 0:
+            self._streaming_encoder = StreamingVideoEncoder(
+                fps=self.meta.fps,
+                vcodec=self.vcodec,
+                pix_fmt="yuv420p",
+                g=2,
+                crf=30,
+                preset=None,
+                queue_maxsize=encoder_queue_maxsize,
+                encoder_threads=encoder_threads,
+            )
 
+    def _close_writer(self) -> None:
+        """Close and cleanup the parquet writer if it exists."""
+        writer = getattr(self, "writer", None)
+        if writer is not None:
+            writer.close()
+            self.writer = None
 
-def _keep_episodes_from_video_with_av(
-    input_path: Path,
-    output_path: Path,
-    episodes_to_keep: list[tuple[int, int]],
-    fps: float,
-    vcodec: str = "libsvtav1",
-    pix_fmt: str = "yuv420p",
-) -> None:
-    """Keep only specified episodes from a video file using PyAV.
+    def __del__(self):
+        """
+        Trust the user to call .finalize() but as an added safety check call the parquet writer to stop when calling the destructor
+        """
+        self._close_writer()
 
-    This function decodes frames from specified frame ranges and re-encodes them with
-    properly reset timestamps to ensure monotonic progression.
+    def push_to_hub(
+        self,
+        branch: str | None = None,
+        tags: list | None = None,
+        license: str | None = "apache-2.0",
+        tag_version: bool = True,
+        push_videos: bool = True,
+        private: bool = False,
+        allow_patterns: list[str] | str | None = None,
+        upload_large_folder: bool = False,
+        **card_kwargs,
+    ) -> None:
+        ignore_patterns = ["images/"]
+        if not push_videos:
+            ignore_patterns.append("videos/")
 
-    Args:
-        input_path: Source video file path.
-        output_path: Destination video file path.
-        episodes_to_keep: List of (start_frame, end_frame) tuples for episodes to keep.
-            Ranges are half-open intervals: [start_frame, end_frame), where start_frame
-            is inclusive and end_frame is exclusive.
-        fps: Frame rate of the video.
-        vcodec: Video codec to use for encoding.
-        pix_fmt: Pixel format for output video.
-    """
-    from fractions import Fraction
-
-    import av
-
-    if not episodes_to_keep:
-        raise ValueError("No episodes to keep")
-
-    in_container = av.open(str(input_path))
-
-    # Check if video stream exists.
-    if not in_container.streams.video:
-        raise ValueError(
-            f"No video streams found in {input_path}. "
-            "The video file may be corrupted or empty. "
-            "Try re-downloading the dataset or checking the video file."
+        hub_api = HfApi()
+        hub_api.create_repo(
+            repo_id=self.repo_id,
+            private=private,
+            repo_type="dataset",
+            exist_ok=True,
         )
+        if branch:
+            hub_api.create_branch(
+                repo_id=self.repo_id,
+                branch=branch,
+                revision=self.revision,
+                repo_type="dataset",
+                exist_ok=True,
+            )
 
-    v_in = in_container.streams.video[0]
-
-    out = av.open(str(output_path), mode="w")
-
-    # Convert fps to Fraction for PyAV compatibility.
-    fps_fraction = Fraction(fps).limit_denominator(1000)
-    v_out = out.add_stream(vcodec, rate=fps_fraction)
-
-    # PyAV type stubs don't distinguish video streams from audio/subtitle streams.
-    v_out.width = v_in.codec_context.width
-    v_out.height = v_in.codec_context.height
-    v_out.pix_fmt = pix_fmt
-
-    # Set time_base to match the frame rate for proper timestamp handling.
-    v_out.time_base = Fraction(1, int(fps))
-
-    out.start_encoding()
-
-    # Create set of (start, end) ranges for fast lookup.
-    # Convert to a sorted list for efficient checking.
-    frame_ranges = sorted(episodes_to_keep)
-
-    # Track frame index for setting PTS and current range being processed.
-    src_frame_count = 0
-    frame_count = 0
-    range_idx = 0
-
-    # Read through entire video once and filter frames.
-    for packet in in_container.demux(v_in):
-        for frame in packet.decode():
-            if frame is None:
-                continue
-
-            # Check if frame is in any of our desired frame ranges.
-            # Skip ranges that have already passed.
-            while range_idx < len(frame_ranges) and src_frame_count >= frame_ranges[range_idx][1]:
-                range_idx += 1
-
-            # If we've passed all ranges, stop processing.
-            if range_idx >= len(frame_ranges):
-                break
-
-            # Check if frame is in current range.
-            start_frame = frame_ranges[range_idx][0]
-
-            if src_frame_count < start_frame:
-                src_frame_count += 1
-                continue
-
-            # Frame is in range - create a new frame with reset timestamps.
-            # We need to create a copy to avoid modifying the original.
-            new_frame = frame.reformat(width=v_out.width, height=v_out.height, format=v_out.pix_fmt)
-            new_frame.pts = frame_count
-            new_frame.time_base = Fraction(1, int(fps))
-
-            # Encode and mux the frame.
-            for pkt in v_out.encode(new_frame):
-                out.mux(pkt)
-
-            src_frame_count += 1
-            frame_count += 1
-
-    # Flush encoder.
-    for pkt in v_out.encode():
-        out.mux(pkt)
-
-    out.close()
-    in_container.close()
-
-
-def _copy_and_reindex_videos(
-    src_dataset: LeRobotDataset,
-    dst_meta: LeRobotDatasetMetadata,
-    episode_mapping: dict[int, int],
-    vcodec: str = "libsvtav1",
-    pix_fmt: str = "yuv420p",
-) -> dict[int, dict]:
-    """Copy and filter video files, only re-encoding files with deleted episodes.
-
-    For video files that only contain kept episodes, we copy them directly.
-    For files with mixed kept/deleted episodes, we use PyAV filters to efficiently
-    re-encode only the desired segments.
-
-    Args:
-        src_dataset: Source dataset to copy from
-        dst_meta: Destination metadata object
-        episode_mapping: Mapping from old episode indices to new indices
-
-    Returns:
-        dict mapping episode index to its video metadata (chunk_index, file_index, timestamps)
-    """
-    if src_dataset.meta.episodes is None:
-        src_dataset.meta.episodes = load_episodes(src_dataset.meta.root)
-
-    episodes_video_metadata: dict[int, dict] = {new_idx: {} for new_idx in episode_mapping.values()}
-
-    for video_key in src_dataset.meta.video_keys:
-        logging.info(f"Processing videos for {video_key}")
-
-        if dst_meta.video_path is None:
-            raise ValueError("Destination metadata has no video_path defined")
-
-        file_to_episodes: dict[tuple[int, int], list[int]] = {}
-        for old_idx in episode_mapping:
-            src_ep = src_dataset.meta.episodes[old_idx]
-            chunk_idx = src_ep[f"videos/{video_key}/chunk_index"]
-            file_idx = src_ep[f"videos/{video_key}/file_index"]
-            file_key = (chunk_idx, file_idx)
-            if file_key not in file_to_episodes:
-                file_to_episodes[file_key] = []
-            file_to_episodes[file_key].append(old_idx)
-
-        for (src_chunk_idx, src_file_idx), episodes_in_file in tqdm(
-            sorted(file_to_episodes.items()), desc=f"Processing {video_key} video files"
-        ):
-            all_episodes_in_file = [
-                ep_idx
-                for ep_idx in range(src_dataset.meta.total_episodes)
-                if src_dataset.meta.episodes[ep_idx].get(f"videos/{video_key}/chunk_index") == src_chunk_idx
-                and src_dataset.meta.episodes[ep_idx].get(f"videos/{video_key}/file_index") == src_file_idx
-            ]
-
-            episodes_to_keep_set = set(episodes_in_file)
-            all_in_file_set = set(all_episodes_in_file)
-
-            if all_in_file_set == episodes_to_keep_set:
-                assert src_dataset.meta.video_path is not None
-                src_video_path = src_dataset.root / src_dataset.meta.video_path.format(
-                    video_key=video_key, chunk_index=src_chunk_idx, file_index=src_file_idx
-                )
-                dst_video_path = dst_meta.root / dst_meta.video_path.format(
-                    video_key=video_key, chunk_index=src_chunk_idx, file_index=src_file_idx
-                )
-                dst_video_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy(src_video_path, dst_video_path)
-
-                for old_idx in episodes_in_file:
-                    new_idx = episode_mapping[old_idx]
-                    src_ep = src_dataset.meta.episodes[old_idx]
-                    episodes_video_metadata[new_idx][f"videos/{video_key}/chunk_index"] = src_chunk_idx
-                    episodes_video_metadata[new_idx][f"videos/{video_key}/file_index"] = src_file_idx
-                    episodes_video_metadata[new_idx][f"videos/{video_key}/from_timestamp"] = src_ep[
-                        f"videos/{video_key}/from_timestamp"
-                    ]
-                    episodes_video_metadata[new_idx][f"videos/{video_key}/to_timestamp"] = src_ep[
-                        f"videos/{video_key}/to_timestamp"
-                    ]
-            else:
-                # Build list of frame ranges to keep, in sorted order.
-                sorted_keep_episodes = sorted(episodes_in_file, key=lambda x: episode_mapping[x])
-                episodes_to_keep_ranges: list[tuple[int, int]] = []
-                for old_idx in sorted_keep_episodes:
-                    src_ep = src_dataset.meta.episodes[old_idx]
-                    from_frame = round(src_ep[f"videos/{video_key}/from_timestamp"] * src_dataset.meta.fps)
-                    to_frame = round(src_ep[f"videos/{video_key}/to_timestamp"] * src_dataset.meta.fps)
-                    assert src_ep["length"] == to_frame - from_frame, (
-                        f"Episode length mismatch: {src_ep['length']} vs {to_frame - from_frame}"
-                    )
-                    episodes_to_keep_ranges.append((from_frame, to_frame))
-
-                # Use PyAV filters to efficiently re-encode only the desired segments.
-                assert src_dataset.meta.video_path is not None
-                src_video_path = src_dataset.root / src_dataset.meta.video_path.format(
-                    video_key=video_key, chunk_index=src_chunk_idx, file_index=src_file_idx
-                )
-                dst_video_path = dst_meta.root / dst_meta.video_path.format(
-                    video_key=video_key, chunk_index=src_chunk_idx, file_index=src_file_idx
-                )
-                dst_video_path.parent.mkdir(parents=True, exist_ok=True)
-
-                logging.info(
-                    f"Re-encoding {video_key} (chunk {src_chunk_idx}, file {src_file_idx}) "
-                    f"with {len(episodes_to_keep_ranges)} episodes"
-                )
-                _keep_episodes_from_video_with_av(
-                    src_video_path,
-                    dst_video_path,
-                    episodes_to_keep_ranges,
-                    src_dataset.meta.fps,
-                    vcodec,
-                    pix_fmt,
-                )
-
-                cumulative_ts = 0.0
-                for old_idx in sorted_keep_episodes:
-                    new_idx = episode_mapping[old_idx]
-                    src_ep = src_dataset.meta.episodes[old_idx]
-                    ep_length = src_ep["length"]
-                    ep_duration = ep_length / src_dataset.meta.fps
-
-                    episodes_video_metadata[new_idx][f"videos/{video_key}/chunk_index"] = src_chunk_idx
-                    episodes_video_metadata[new_idx][f"videos/{video_key}/file_index"] = src_file_idx
-                    episodes_video_metadata[new_idx][f"videos/{video_key}/from_timestamp"] = cumulative_ts
-                    episodes_video_metadata[new_idx][f"videos/{video_key}/to_timestamp"] = (
-                        cumulative_ts + ep_duration
-                    )
-
-                    cumulative_ts += ep_duration
-
-    return episodes_video_metadata
-
-
-def _copy_and_reindex_episodes_metadata(
-    src_dataset: LeRobotDataset,
-    dst_meta: LeRobotDatasetMetadata,
-    episode_mapping: dict[int, int],
-    data_metadata: dict[int, dict],
-    video_metadata: dict[int, dict] | None = None,
-) -> None:
-    """Copy and reindex episodes metadata using provided data and video metadata.
-
-    Args:
-        src_dataset: Source dataset to copy from
-        dst_meta: Destination metadata object
-        episode_mapping: Mapping from old episode indices to new indices
-        data_metadata: Dict mapping new episode index to its data file metadata
-        video_metadata: Optional dict mapping new episode index to its video metadata
-    """
-    from lerobot.datasets.utils import flatten_dict
-
-    if src_dataset.meta.episodes is None:
-        src_dataset.meta.episodes = load_episodes(src_dataset.meta.root)
-
-    all_stats = []
-    total_frames = 0
-
-    for old_idx, new_idx in tqdm(
-        sorted(episode_mapping.items(), key=lambda x: x[1]), desc="Processing episodes metadata"
-    ):
-        src_episode_full = _load_episode_with_stats(src_dataset, old_idx)
-
-        src_episode = src_dataset.meta.episodes[old_idx]
-
-        episode_meta = data_metadata[new_idx].copy()
-
-        if video_metadata and new_idx in video_metadata:
-            episode_meta.update(video_metadata[new_idx])
-
-        # Extract episode statistics from parquet metadata.
-        # Note (maractingi): When pandas/pyarrow serializes numpy arrays with shape (3, 1, 1) to parquet,
-        # they are being deserialized as nested object arrays like:
-        #   array([array([array([0.])]), array([array([0.])]), array([array([0.])])])
-        # This happens particularly with image/video statistics. We need to detect and flatten
-        # these nested structures back to proper (3, 1, 1) arrays so aggregate_stats can process them.
-        episode_stats = {}
-        for key in src_episode_full:
-            if key.startswith("stats/"):
-                stat_key = key.replace("stats/", "")
-                parts = stat_key.split("/")
-                if len(parts) == 2:
-                    feature_name, stat_name = parts
-                    if feature_name not in episode_stats:
-                        episode_stats[feature_name] = {}
-
-                    value = src_episode_full[key]
-
-                    if feature_name in src_dataset.meta.features:
-                        feature_dtype = src_dataset.meta.features[feature_name]["dtype"]
-                        if feature_dtype in ["image", "video"] and stat_name != "count":
-                            if isinstance(value, np.ndarray) and value.dtype == object:
-                                flat_values = []
-                                for item in value:
-                                    while isinstance(item, np.ndarray):
-                                        item = item.flatten()[0]
-                                    flat_values.append(item)
-                                value = np.array(flat_values, dtype=np.float64).reshape(3, 1, 1)
-                            elif isinstance(value, np.ndarray) and value.shape == (3,):
-                                value = value.reshape(3, 1, 1)
-
-                    episode_stats[feature_name][stat_name] = value
-
-        all_stats.append(episode_stats)
-
-        episode_dict = {
-            "episode_index": new_idx,
-            "tasks": src_episode["tasks"],
-            "length": src_episode["length"],
+        upload_kwargs = {
+            "repo_id": self.repo_id,
+            "folder_path": self.root,
+            "repo_type": "dataset",
+            "revision": branch,
+            "allow_patterns": allow_patterns,
+            "ignore_patterns": ignore_patterns,
         }
-        episode_dict.update(episode_meta)
-        episode_dict.update(flatten_dict({"stats": episode_stats}))
-        dst_meta._save_episode_metadata(episode_dict)
-
-        total_frames += src_episode["length"]
-
-    dst_meta._close_writer()
-
-    dst_meta.info.update(
-        {
-            "total_episodes": len(episode_mapping),
-            "total_frames": total_frames,
-            "total_tasks": len(dst_meta.tasks) if dst_meta.tasks is not None else 0,
-            "splits": {"train": f"0:{len(episode_mapping)}"},
-        }
-    )
-    write_info(dst_meta.info, dst_meta.root)
-
-    if not all_stats:
-        logging.warning("No statistics found to aggregate")
-        return
-
-    logging.info(f"Aggregating statistics for {len(all_stats)} episodes")
-    aggregated_stats = aggregate_stats(all_stats)
-    filtered_stats = {k: v for k, v in aggregated_stats.items() if k in dst_meta.features}
-    write_stats(filtered_stats, dst_meta.root)
-
-
-def _write_parquet(df: pd.DataFrame, path: Path, meta: LeRobotDatasetMetadata) -> None:
-    """Write DataFrame to parquet
-
-    This ensures images are properly embedded and the file can be loaded correctly by HF datasets.
-    """
-    from lerobot.datasets.utils import embed_images, get_hf_features_from_features
-
-    hf_features = get_hf_features_from_features(meta.features)
-    ep_dataset = datasets.Dataset.from_dict(df.to_dict(orient="list"), features=hf_features, split="train")
-
-    if len(meta.image_keys) > 0:
-        ep_dataset = embed_images(ep_dataset)
-
-    table = ep_dataset.with_format("arrow")[:]
-    writer = pq.ParquetWriter(path, schema=table.schema, compression="snappy", use_dictionary=True)
-    writer.write_table(table)
-    writer.close()
-
-
-def _save_data_chunk(
-    df: pd.DataFrame,
-    meta: LeRobotDatasetMetadata,
-    chunk_idx: int = 0,
-    file_idx: int = 0,
-) -> tuple[int, int, dict[int, dict]]:
-    """Save a data chunk and return updated indices and episode metadata.
-
-    Returns:
-        tuple: (next_chunk_idx, next_file_idx, episode_metadata_dict)
-            where episode_metadata_dict maps episode_index to its data file metadata
-    """
-    path = meta.root / DEFAULT_DATA_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    _write_parquet(df, path, meta)
-
-    episode_metadata = {}
-    for ep_idx in df["episode_index"].unique():
-        ep_df = df[df["episode_index"] == ep_idx]
-        episode_metadata[ep_idx] = {
-            "data/chunk_index": chunk_idx,
-            "data/file_index": file_idx,
-            "dataset_from_index": int(ep_df["index"].min()),
-            "dataset_to_index": int(ep_df["index"].max() + 1),
-        }
-
-    file_size = get_parquet_file_size_in_mb(path)
-    if file_size >= DEFAULT_DATA_FILE_SIZE_IN_MB * 0.9:
-        chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, DEFAULT_CHUNK_SIZE)
-
-    return chunk_idx, file_idx, episode_metadata
-
-
-def _copy_data_with_feature_changes(
-    dataset: LeRobotDataset,
-    new_meta: LeRobotDatasetMetadata,
-    add_features: dict[str, tuple] | None = None,
-    remove_features: list[str] | None = None,
-) -> None:
-    """Copy data while adding or removing features."""
-    data_dir = dataset.root / DATA_DIR
-    parquet_files = sorted(data_dir.glob("*/*.parquet"))
-
-    if not parquet_files:
-        raise ValueError(f"No parquet files found in {data_dir}")
-
-    frame_idx = 0
-
-    for src_path in tqdm(parquet_files, desc="Processing data files"):
-        df = pd.read_parquet(src_path).reset_index(drop=True)
-
-        relative_path = src_path.relative_to(dataset.root)
-        chunk_dir = relative_path.parts[1]
-        file_name = relative_path.parts[2]
-
-        chunk_idx = int(chunk_dir.split("-")[1])
-        file_idx = int(file_name.split("-")[1].split(".")[0])
-
-        if remove_features:
-            df = df.drop(columns=remove_features, errors="ignore")
-
-        if add_features:
-            end_idx = frame_idx + len(df)
-            for feature_name, (values, _) in add_features.items():
-                if callable(values):
-                    feature_values = []
-                    for _, row in df.iterrows():
-                        ep_idx = row["episode_index"]
-                        frame_in_ep = row["frame_index"]
-                        value = values(row.to_dict(), ep_idx, frame_in_ep)
-                        if isinstance(value, np.ndarray) and value.size == 1:
-                            value = value.item()
-                        feature_values.append(value)
-                    df[feature_name] = feature_values
-                else:
-                    feature_slice = values[frame_idx:end_idx]
-                    if len(feature_slice.shape) > 1 and feature_slice.shape[1] == 1:
-                        df[feature_name] = feature_slice.flatten()
-                    else:
-                        df[feature_name] = feature_slice
-            frame_idx = end_idx
-
-        # Write using the same chunk/file structure as source
-        dst_path = new_meta.root / DEFAULT_DATA_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
-        dst_path.parent.mkdir(parents=True, exist_ok=True)
-
-        _write_parquet(df, dst_path, new_meta)
-
-    _copy_episodes_metadata_and_stats(dataset, new_meta)
-
-
-def _copy_videos(
-    src_dataset: LeRobotDataset,
-    dst_meta: LeRobotDatasetMetadata,
-    exclude_keys: list[str] | None = None,
-) -> None:
-    """Copy video files, optionally excluding certain keys."""
-    if exclude_keys is None:
-        exclude_keys = []
-
-    for video_key in src_dataset.meta.video_keys:
-        if video_key in exclude_keys:
-            continue
-
-        video_files = set()
-        for ep_idx in range(len(src_dataset.meta.episodes)):
-            try:
-                video_files.add(src_dataset.meta.get_video_file_path(ep_idx, video_key))
-            except KeyError:
-                continue
-
-        for src_path in tqdm(sorted(video_files), desc=f"Copying {video_key} videos"):
-            dst_path = dst_meta.root / src_path
-            dst_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy(src_dataset.root / src_path, dst_path)
-
-
-def _copy_episodes_metadata_and_stats(
-    src_dataset: LeRobotDataset,
-    dst_meta: LeRobotDatasetMetadata,
-) -> None:
-    """Copy episodes metadata and recalculate stats."""
-    if src_dataset.meta.tasks is not None:
-        write_tasks(src_dataset.meta.tasks, dst_meta.root)
-        dst_meta.tasks = src_dataset.meta.tasks.copy()
-
-    episodes_dir = src_dataset.root / "meta/episodes"
-    dst_episodes_dir = dst_meta.root / "meta/episodes"
-    if episodes_dir.exists():
-        shutil.copytree(episodes_dir, dst_episodes_dir, dirs_exist_ok=True)
-
-    dst_meta.info.update(
-        {
-            "total_episodes": src_dataset.meta.total_episodes,
-            "total_frames": src_dataset.meta.total_frames,
-            "total_tasks": src_dataset.meta.total_tasks,
-            "splits": src_dataset.meta.info.get("splits", {"train": f"0:{src_dataset.meta.total_episodes}"}),
-        }
-    )
-
-    if dst_meta.video_keys and src_dataset.meta.video_keys:
-        for key in dst_meta.video_keys:
-            if key in src_dataset.meta.features:
-                dst_meta.info["features"][key]["info"] = src_dataset.meta.info["features"][key].get(
-                    "info", {}
-                )
-
-    write_info(dst_meta.info, dst_meta.root)
-
-    if set(dst_meta.features.keys()) != set(src_dataset.meta.features.keys()):
-        logging.info("Recalculating dataset statistics...")
-        if src_dataset.meta.stats:
-            new_stats = {}
-            for key in dst_meta.features:
-                if key in src_dataset.meta.stats:
-                    new_stats[key] = src_dataset.meta.stats[key]
-            write_stats(new_stats, dst_meta.root)
-    else:
-        if src_dataset.meta.stats:
-            write_stats(src_dataset.meta.stats, dst_meta.root)
-
-
-def _save_episode_images_for_video(
-    dataset: LeRobotDataset,
-    imgs_dir: Path,
-    img_key: str,
-    episode_index: int,
-    num_workers: int = 4,
-) -> None:
-    """Save images from a specific episode and camera to disk for video encoding.
-
-    Args:
-        dataset: The LeRobot dataset to extract images from
-        imgs_dir: Directory to save images to
-        img_key: The image key (camera) to extract
-        episode_index: Index of the episode to save
-        num_workers: Number of threads for parallel image saving
-    """
-    # Create directory
-    imgs_dir.mkdir(parents=True, exist_ok=True)
-
-    # Get dataset without torch format for PIL image access
-    hf_dataset = dataset.hf_dataset.with_format(None)
-
-    # Select only this camera's images
-    imgs_dataset = hf_dataset.select_columns(img_key)
-
-    # Get episode start and end indices
-    from_idx = dataset.meta.episodes["dataset_from_index"][episode_index]
-    to_idx = dataset.meta.episodes["dataset_to_index"][episode_index]
-
-    # Get all items for this episode
-    episode_dataset = imgs_dataset.select(range(from_idx, to_idx))
-
-    # Define function to save a single image
-    def save_single_image(i_item_tuple):
-        i, item = i_item_tuple
-        img = item[img_key]
-        # Use frame-XXXXXX.png format to match encode_video_frames expectations
-        img.save(str(imgs_dir / f"frame-{i:06d}.png"), quality=100)
-        return i
-
-    # Save images with proper naming convention for encode_video_frames (frame-XXXXXX.png)
-    items = list(enumerate(episode_dataset))
-
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(save_single_image, item) for item in items]
-        for future in as_completed(futures):
-            future.result()  # This will raise any exceptions that occurred
-
-
-def _save_batch_episodes_images(
-    dataset: LeRobotDataset,
-    imgs_dir: Path,
-    img_key: str,
-    episode_indices: list[int],
-    num_workers: int = 4,
-) -> list[float]:
-    """Save images from multiple episodes to disk for batch video encoding.
-
-    Args:
-        dataset: The LeRobot dataset to extract images from
-        imgs_dir: Directory to save images to
-        img_key: The image key (camera) to extract
-        episode_indices: List of episode indices to save
-        num_workers: Number of threads for parallel image saving
-
-    Returns:
-        List of episode durations in seconds
-    """
-    imgs_dir.mkdir(parents=True, exist_ok=True)
-    hf_dataset = dataset.hf_dataset.with_format(None)
-    imgs_dataset = hf_dataset.select_columns(img_key)
-
-    # Define function to save a single image with global frame index
-    # Defined once outside the loop to avoid repeated closure creation
-    def save_single_image(i_item_tuple, base_frame_idx, img_key_param):
-        i, item = i_item_tuple
-        img = item[img_key_param]
-        # Use global frame index for naming
-        img.save(str(imgs_dir / f"frame-{base_frame_idx + i:06d}.png"), quality=100)
-        return i
-
-    episode_durations = []
-    frame_idx = 0
-
-    for ep_idx in episode_indices:
-        # Get episode range
-        from_idx = dataset.meta.episodes["dataset_from_index"][ep_idx]
-        to_idx = dataset.meta.episodes["dataset_to_index"][ep_idx]
-        episode_length = to_idx - from_idx
-        episode_durations.append(episode_length / dataset.fps)
-
-        # Get episode images
-        episode_dataset = imgs_dataset.select(range(from_idx, to_idx))
-
-        # Save images
-        items = list(enumerate(episode_dataset))
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            futures = [executor.submit(save_single_image, item, frame_idx, img_key) for item in items]
-            for future in as_completed(futures):
-                future.result()
-
-        frame_idx += episode_length
-
-    return episode_durations
-
-
-def _iter_episode_batches(
-    episode_indices: list[int],
-    episode_lengths: dict[int, int],
-    size_per_frame_mb: float,
-    video_file_size_limit: float,
-    max_episodes: int | None,
-    max_frames: int | None,
-):
-    """Generator that yields batches of episode indices for video encoding.
-
-    Groups episodes into batches that respect size and memory constraints:
-    - Stays under video file size limit
-    - Respects maximum episodes per batch (if specified)
-    - Respects maximum frames per batch (if specified)
-
-    Args:
-        episode_indices: List of episode indices to batch
-        episode_lengths: Dictionary mapping episode index to episode length
-        size_per_frame_mb: Estimated size per frame in MB
-        video_file_size_limit: Maximum video file size in MB
-        max_episodes: Maximum number of episodes per batch (None = no limit)
-        max_frames: Maximum number of frames per batch (None = no limit)
-
-    Yields:
-        List of episode indices for each batch
-    """
-    batch_episodes = []
-    estimated_size = 0.0
-    total_frames = 0
-
-    for ep_idx in episode_indices:
-        ep_length = episode_lengths[ep_idx]
-        ep_estimated_size = ep_length * size_per_frame_mb
-
-        # we check if adding this episode would exceed any constraint
-        would_exceed_size = estimated_size > 0 and estimated_size + ep_estimated_size >= video_file_size_limit
-        would_exceed_episodes = max_episodes is not None and len(batch_episodes) >= max_episodes
-        would_exceed_frames = max_frames is not None and total_frames + ep_length > max_frames
-
-        if batch_episodes and (would_exceed_size or would_exceed_episodes or would_exceed_frames):
-            # yield current batch before adding this episode
-            yield batch_episodes
-            # start a new batch with current episode
-            batch_episodes = [ep_idx]
-            estimated_size = ep_estimated_size
-            total_frames = ep_length
+        if upload_large_folder:
+            hub_api.upload_large_folder(**upload_kwargs)
         else:
-            # add to current batch
-            batch_episodes.append(ep_idx)
-            estimated_size += ep_estimated_size
-            total_frames += ep_length
+            hub_api.upload_folder(**upload_kwargs)
 
-    # yield final batch if not empty
-    if batch_episodes:
-        yield batch_episodes
+        card = create_lerobot_dataset_card(
+            tags=tags, dataset_info=self.meta.info, license=license, repo_id=self.repo_id, **card_kwargs
+        )
+        card.push_to_hub(repo_id=self.repo_id, repo_type="dataset", revision=branch)
 
+        if tag_version:
+            with contextlib.suppress(RevisionNotFoundError):
+                hub_api.delete_tag(self.repo_id, tag=CODEBASE_VERSION, repo_type="dataset")
+            hub_api.create_tag(self.repo_id, tag=CODEBASE_VERSION, revision=branch, repo_type="dataset")
 
-def _estimate_frame_size_via_calibration(
-    dataset: LeRobotDataset,
-    img_key: str,
-    episode_indices: list[int],
-    temp_dir: Path,
-    fps: int,
-    vcodec: str,
-    pix_fmt: str,
-    g: int,
-    crf: int,
-    fast_decode: int,
-    num_calibration_frames: int = 30,
-) -> float:
-    """Estimate MB per frame by encoding a small calibration sample.
-
-    Encodes a representative sample of frames using the exact codec parameters
-    to measure actual compression ratio, which is more accurate than heuristics.
-
-    Args:
-        dataset: Source dataset with images.
-        img_key: Image key to calibrate (e.g., "observation.images.top").
-        episode_indices: List of episode indices being processed.
-        temp_dir: Temporary directory for calibration files.
-        fps: Frames per second for video encoding.
-        vcodec: Video codec (libsvtav1, h264, hevc).
-        pix_fmt: Pixel format (yuv420p, etc.).
-        g: GOP size (group of pictures).
-        crf: Constant Rate Factor (quality).
-        fast_decode: Fast decode tuning parameter.
-        num_calibration_frames: Number of frames to use for calibration (default: 30).
-
-    Returns:
-        Estimated size in MB per frame based on actual encoding.
-    """
-    calibration_dir = temp_dir / "calibration" / img_key
-    calibration_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        # Select a representative episode (prefer middle episode if available)
-        calibration_ep_idx = episode_indices[len(episode_indices) // 2]
-
-        # Get episode range
-        from_idx = dataset.meta.episodes["dataset_from_index"][calibration_ep_idx]
-        to_idx = dataset.meta.episodes["dataset_to_index"][calibration_ep_idx]
-        episode_length = to_idx - from_idx
-
-        # Use up to num_calibration_frames from this episode
-        num_frames = min(num_calibration_frames, episode_length)
-
-        # Get frames from dataset
-        hf_dataset = dataset.hf_dataset.with_format(None)
-        sample_indices = range(from_idx, from_idx + num_frames)
-
-        # Save calibration frames
-        for i, idx in enumerate(sample_indices):
-            img = hf_dataset[idx][img_key]
-            img.save(str(calibration_dir / f"frame-{i:06d}.png"), quality=100)
-
-        # Encode calibration video
-        calibration_video_path = calibration_dir / "calibration.mp4"
-        encode_video_frames(
-            imgs_dir=calibration_dir,
-            video_path=calibration_video_path,
-            fps=fps,
-            vcodec=vcodec,
-            pix_fmt=pix_fmt,
-            g=g,
-            crf=crf,
-            fast_decode=fast_decode,
-            overwrite=True,
+    def pull_from_repo(
+        self,
+        allow_patterns: list[str] | str | None = None,
+        ignore_patterns: list[str] | str | None = None,
+    ) -> None:
+        snapshot_download(
+            self.repo_id,
+            repo_type="dataset",
+            revision=self.revision,
+            local_dir=self.root,
+            allow_patterns=allow_patterns,
+            ignore_patterns=ignore_patterns,
         )
 
-        # Measure actual compressed size
-        video_size_bytes = calibration_video_path.stat().st_size
-        video_size_mb = video_size_bytes / BYTES_PER_MIB
-        size_per_frame_mb = video_size_mb / num_frames
+    def download(self, download_videos: bool = True) -> None:
+        """Downloads the dataset from the given 'repo_id' at the provided version. If 'episodes' is given, this
+        will only download those episodes (selected by their episode_index). If 'episodes' is None, the whole
+        dataset will be downloaded. Thanks to the behavior of snapshot_download, if the files are already present
+        in 'local_dir', they won't be downloaded again.
+        """
+        # TODO(rcadene, aliberts): implement faster transfer
+        # https://huggingface.co/docs/huggingface_hub/en/guides/download#faster-downloads
+        ignore_patterns = None if download_videos else "videos/"
+        files = None
+        if self.episodes is not None:
+            files = self.get_episodes_file_paths()
+        self.pull_from_repo(allow_patterns=files, ignore_patterns=ignore_patterns)
+
+    def get_episodes_file_paths(self) -> list[Path]:
+        episodes = self.episodes if self.episodes is not None else list(range(self.meta.total_episodes))
+        fpaths = [str(self.meta.get_data_file_path(ep_idx)) for ep_idx in episodes]
+        if len(self.meta.video_keys) > 0:
+            video_files = [
+                str(self.meta.get_video_file_path(ep_idx, vid_key))
+                for vid_key in self.meta.video_keys
+                for ep_idx in episodes
+            ]
+            fpaths += video_files
+        # episodes are stored in the same files, so we return unique paths only
+        fpaths = list(set(fpaths))
+        return fpaths
+
+    def load_hf_dataset(self) -> datasets.Dataset:
+        """hf_dataset contains all the observations, states, actions, rewards, etc."""
+        features = get_hf_features_from_features(self.features)
+        hf_dataset = load_nested_dataset(self.root / "data", features=features, episodes=self.episodes)
+        hf_dataset.set_transform(hf_transform_to_torch)
+        return hf_dataset
+
+    def _check_cached_episodes_sufficient(self) -> bool:
+        """Check if the cached dataset contains all requested episodes and their video files."""
+        if self.hf_dataset is None or len(self.hf_dataset) == 0:
+            return False
+
+        # Get available episode indices from cached dataset
+        available_episodes = {
+            ep_idx.item() if isinstance(ep_idx, torch.Tensor) else ep_idx
+            for ep_idx in self.hf_dataset.unique("episode_index")
+        }
+
+        # Determine requested episodes
+        if self.episodes is None:
+            requested_episodes = set(range(self.meta.total_episodes))
+        else:
+            requested_episodes = set(self.episodes)
+
+        # Check if all requested episodes are available in cached data
+        if not requested_episodes.issubset(available_episodes):
+            return False
+
+        # Check if all required video files exist
+        if len(self.meta.video_keys) > 0:
+            for ep_idx in requested_episodes:
+                for vid_key in self.meta.video_keys:
+                    video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+                    if not video_path.exists():
+                        return False
+
+        return True
+
+    def create_hf_dataset(self) -> datasets.Dataset:
+        features = get_hf_features_from_features(self.features)
+        ft_dict = {col: [] for col in features}
+        hf_dataset = datasets.Dataset.from_dict(ft_dict, features=features, split="train")
+        hf_dataset.set_transform(hf_transform_to_torch)
+        return hf_dataset
+
+    @property
+    def fps(self) -> int:
+        """Frames per second used during data collection."""
+        return self.meta.fps
+
+    @property
+    def num_frames(self) -> int:
+        """Number of frames in selected episodes.
+
+        Note: When episodes a subset of the full dataset is requested, we must return the
+        actual loaded data length (len(self.hf_dataset)) rather than metadata total_frames.
+        self.meta.total_frames is the total number of frames in the full dataset.
+        """
+        if self.episodes is not None and self.hf_dataset is not None:
+            return len(self.hf_dataset)
+        return self.meta.total_frames
+
+    @property
+    def num_episodes(self) -> int:
+        """Number of episodes selected."""
+        return len(self.episodes) if self.episodes is not None else self.meta.total_episodes
+
+    @property
+    def features(self) -> dict[str, dict]:
+        return self.meta.features
+
+    @property
+    def hf_features(self) -> datasets.Features:
+        """Features of the hf_dataset."""
+        if self.hf_dataset is not None:
+            return self.hf_dataset.features
+        else:
+            return get_hf_features_from_features(self.features)
+
+    def _get_query_indices(
+        self, abs_idx: int, ep_idx: int
+    ) -> tuple[dict[str, list[int]], dict[str, torch.Tensor]]:
+        """Compute query indices for delta timestamps.
+
+        Args:
+            abs_idx: The absolute index in the full dataset (not the relative index in filtered episodes).
+            ep_idx: The episode index.
+
+        Returns:
+            A tuple of (query_indices, padding) where:
+            - query_indices: Dict mapping keys to lists of absolute indices to query
+            - padding: Dict mapping "{key}_is_pad" to boolean tensors indicating padded positions
+        """
+        ep = self.meta.episodes[ep_idx]
+        ep_start = ep["dataset_from_index"]
+        ep_end = ep["dataset_to_index"]
+        query_indices = {
+            key: [max(ep_start, min(ep_end - 1, abs_idx + delta)) for delta in delta_idx]
+            for key, delta_idx in self.delta_indices.items()
+        }
+        padding = {  # Pad values outside of current episode range
+            f"{key}_is_pad": torch.BoolTensor(
+                [(abs_idx + delta < ep_start) | (abs_idx + delta >= ep_end) for delta in delta_idx]
+            )
+            for key, delta_idx in self.delta_indices.items()
+        }
+        return query_indices, padding
+
+    def _get_query_timestamps(
+        self,
+        current_ts: float,
+        query_indices: dict[str, list[int]] | None = None,
+    ) -> dict[str, list[float]]:
+        query_timestamps = {}
+        for key in self.meta.video_keys:
+            if query_indices is not None and key in query_indices:
+                if self._absolute_to_relative_idx is not None:
+                    relative_indices = [self._absolute_to_relative_idx[idx] for idx in query_indices[key]]
+                    timestamps = self.hf_dataset[relative_indices]["timestamp"]
+                else:
+                    timestamps = self.hf_dataset[query_indices[key]]["timestamp"]
+                query_timestamps[key] = torch.stack(timestamps).tolist()
+            else:
+                query_timestamps[key] = [current_ts]
+
+        return query_timestamps
+
+    def _query_hf_dataset(self, query_indices: dict[str, list[int]]) -> dict:
+        """
+        Query dataset for indices across keys, skipping video keys.
+
+        Tries column-first [key][indices] for speed, falls back to row-first.
+
+        Args:
+            query_indices: Dict mapping keys to index lists to retrieve
+
+        Returns:
+            Dict with stacked tensors of queried data (video keys excluded)
+        """
+        result: dict = {}
+        for key, q_idx in query_indices.items():
+            if key in self.meta.video_keys:
+                continue
+            # Map absolute indices to relative indices if needed
+            relative_indices = (
+                q_idx
+                if self._absolute_to_relative_idx is None
+                else [self._absolute_to_relative_idx[idx] for idx in q_idx]
+            )
+            try:
+                result[key] = torch.stack(self.hf_dataset[key][relative_indices])
+            except (KeyError, TypeError, IndexError):
+                result[key] = torch.stack(self.hf_dataset[relative_indices][key])
+        return result
+
+    def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
+        """Note: When using data workers (e.g. DataLoader with num_workers>0), do not call this function
+        in the main process (e.g. by using a second Dataloader with num_workers=0). It will result in a
+        Segmentation Fault. This probably happens because a memory reference to the video loader is created in
+        the main process and a subprocess fails to access it.
+        """
+        ep = self.meta.episodes[ep_idx]
+        item = {}
+        for vid_key, query_ts in query_timestamps.items():
+            # Episodes are stored sequentially on a single mp4 to reduce the number of files.
+            # Thus we load the start timestamp of the episode on this mp4 and,
+            # shift the query timestamp accordingly.
+            from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
+            shifted_query_ts = [from_timestamp + ts for ts in query_ts]
+
+            video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+            frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
+            item[vid_key] = frames.squeeze(0)
+
+        return item
+
+    def _ensure_hf_dataset_loaded(self):
+        """Lazy load the HF dataset only when needed for reading."""
+        if self._lazy_loading or self.hf_dataset is None:
+            # Close the writer before loading to ensure parquet file is properly finalized
+            if self.writer is not None:
+                self._close_writer()
+                self._writer_closed_for_reading = True
+            self.hf_dataset = self.load_hf_dataset()
+            self._lazy_loading = False
+
+    def __len__(self):
+        return self.num_frames
+
+    def __getitem__(self, idx) -> dict:
+        # Ensure dataset is loaded when we actually need to read from it
+        self._ensure_hf_dataset_loaded()
+        item = self.hf_dataset[idx]
+        ep_idx = item["episode_index"].item()
+        # Use the absolute index from the dataset for delta timestamp calculations
+        abs_idx = item["index"].item()
+
+        query_indices = None
+        if self.delta_indices is not None:
+            query_indices, padding = self._get_query_indices(abs_idx, ep_idx)
+            query_result = self._query_hf_dataset(query_indices)
+            item = {**item, **padding}
+            for key, val in query_result.items():
+                item[key] = val
+
+        if len(self.meta.video_keys) > 0:
+            current_ts = item["timestamp"].item()
+            query_timestamps = self._get_query_timestamps(current_ts, query_indices)
+            video_frames = self._query_videos(query_timestamps, ep_idx)
+            item = {**video_frames, **item}
+
+        if self.image_transforms is not None:
+            image_keys = self.meta.camera_keys
+            for cam in image_keys:
+                item[cam] = self.image_transforms(item[cam])
+
+        # Add task as a string
+        task_idx = item["task_index"].item()
+        item["task"] = self.meta.tasks.iloc[task_idx].name
+
+        # add subtask information if available
+        if "subtask_index" in self.features and self.meta.subtasks is not None:
+            subtask_idx = item["subtask_index"].item()
+            item["subtask"] = self.meta.subtasks.iloc[subtask_idx].name
+
+        return item
+
+    def __repr__(self):
+        feature_keys = list(self.features)
+        return (
+            f"{self.__class__.__name__}({{\n"
+            f"    Repository ID: '{self.repo_id}',\n"
+            f"    Number of selected episodes: '{self.num_episodes}',\n"
+            f"    Number of selected samples: '{self.num_frames}',\n"
+            f"    Features: '{feature_keys}',\n"
+            "})',\n"
+        )
+
+    def finalize(self):
+        """
+        Close the parquet writers. This function needs to be called after data collection/conversion, else footer metadata won't be written to the parquet files.
+        The dataset won't be valid and can't be loaded as ds = LeRobotDataset(repo_id=repo, root=HF_LEROBOT_HOME.joinpath(repo))
+        """
+        self._close_writer()
+        self.meta._close_writer()
+        if self._streaming_encoder is not None:
+            self._streaming_encoder.close()
+
+    def create_episode_buffer(self, episode_index: int | None = None) -> dict:
+        current_ep_idx = self.meta.total_episodes if episode_index is None else episode_index
+        ep_buffer = {}
+        # size and task are special cases that are not in self.features
+        ep_buffer["size"] = 0
+        ep_buffer["task"] = []
+        for key in self.features:
+            ep_buffer[key] = current_ep_idx if key == "episode_index" else []
+        return ep_buffer
+
+    # TODO(Steven): consider move this to utils
+    def _get_image_file_path(self, episode_index: int, image_key: str, frame_index: int) -> Path:
+        fpath = DEFAULT_IMAGE_PATH.format(
+            image_key=image_key, episode_index=episode_index, frame_index=frame_index
+        )
+        return self.root / fpath
+
+    def _get_image_file_dir(self, episode_index: int, image_key: str) -> Path:
+        return self._get_image_file_path(episode_index, image_key, frame_index=0).parent
+
+    def _save_image(
+        self, image: torch.Tensor | np.ndarray | PIL.Image.Image, fpath: Path, compress_level: int = 1
+    ) -> None:
+        if self.image_writer is None:
+            if isinstance(image, torch.Tensor):
+                image = image.cpu().numpy()
+            write_image(image, fpath, compress_level=compress_level)
+        else:
+            self.image_writer.save_image(image=image, fpath=fpath, compress_level=compress_level)
+
+    def add_frame(self, frame: dict) -> None:
+        """
+        This function only adds the frame to the episode_buffer. Apart from images — which are written in a
+        temporary directory — nothing is written to disk. To save those frames, the 'save_episode()' method
+        then needs to be called.
+        """
+        # Convert torch to numpy if needed
+        for name in frame:
+            if isinstance(frame[name], torch.Tensor):
+                frame[name] = frame[name].numpy()
+
+        validate_frame(frame, self.features)
+
+        if self.episode_buffer is None:
+            self.episode_buffer = self.create_episode_buffer()
+
+        # Automatically add frame_index and timestamp to episode buffer
+        frame_index = self.episode_buffer["size"]
+        timestamp = frame.pop("timestamp") if "timestamp" in frame else frame_index / self.fps
+        self.episode_buffer["frame_index"].append(frame_index)
+        self.episode_buffer["timestamp"].append(timestamp)
+        self.episode_buffer["task"].append(frame.pop("task"))  # Remove task from frame after processing
+
+        # Start streaming encoder on first frame of episode (once, before iterating keys)
+        if frame_index == 0 and self._streaming_encoder is not None:
+            self._streaming_encoder.start_episode(
+                video_keys=list(self.meta.video_keys),
+                temp_dir=self.root,
+            )
+
+        # Add frame features to episode_buffer
+        for key in frame:
+            if key not in self.features:
+                raise ValueError(
+                    f"An element of the frame is not in the features. '{key}' not in '{self.features.keys()}'."
+                )
+
+            if self.features[key]["dtype"] == "video" and self._streaming_encoder is not None:
+                self._streaming_encoder.feed_frame(key, frame[key])
+                self.episode_buffer[key].append(None)  # Placeholder (video keys are skipped in parquet)
+            elif self.features[key]["dtype"] in ["image", "video"]:
+                img_path = self._get_image_file_path(
+                    episode_index=self.episode_buffer["episode_index"], image_key=key, frame_index=frame_index
+                )
+                if frame_index == 0:
+                    img_path.parent.mkdir(parents=True, exist_ok=True)
+                compress_level = 1 if self.features[key]["dtype"] == "video" else 6
+                self._save_image(frame[key], img_path, compress_level)
+                self.episode_buffer[key].append(str(img_path))
+            else:
+                self.episode_buffer[key].append(frame[key])
+
+        self.episode_buffer["size"] += 1
+
+    def save_episode(
+        self,
+        episode_data: dict | None = None,
+        parallel_encoding: bool = True,
+    ) -> None:
+        """
+        This will save to disk the current episode in self.episode_buffer.
+
+        Video encoding is handled automatically based on batch_encoding_size:
+        - If batch_encoding_size == 1: Videos are encoded immediately after each episode
+        - If batch_encoding_size > 1: Videos are encoded in batches.
+
+        Args:
+            episode_data (dict | None, optional): Dict containing the episode data to save. If None, this will
+                save the current episode in self.episode_buffer, which is filled with 'add_frame'. Defaults to
+                None.
+            parallel_encoding (bool, optional): If True, encode videos in parallel using ProcessPoolExecutor.
+                Defaults to True on Linux, False on macOS as it tends to use all the CPU available already.
+        """
+        episode_buffer = episode_data if episode_data is not None else self.episode_buffer
+
+        validate_episode_buffer(episode_buffer, self.meta.total_episodes, self.features)
+
+        # size and task are special cases that won't be added to hf_dataset
+        episode_length = episode_buffer.pop("size")
+        tasks = episode_buffer.pop("task")
+        episode_tasks = list(set(tasks))
+        episode_index = episode_buffer["episode_index"]
+
+        episode_buffer["index"] = np.arange(self.meta.total_frames, self.meta.total_frames + episode_length)
+        episode_buffer["episode_index"] = np.full((episode_length,), episode_index)
+
+        # Update tasks and task indices with new tasks if any
+        self.meta.save_episode_tasks(episode_tasks)
+
+        # Given tasks in natural language, find their corresponding task indices
+        episode_buffer["task_index"] = np.array([self.meta.get_task_index(task) for task in tasks])
+
+        for key, ft in self.features.items():
+            # index, episode_index, task_index are already processed above, and image and video
+            # are processed separately by storing image path and frame info as meta data
+            if key in ["index", "episode_index", "task_index"] or ft["dtype"] in ["image", "video"]:
+                continue
+            episode_buffer[key] = np.stack(episode_buffer[key])
+
+        # Wait for image writer to end, so that episode stats over images can be computed
+        self._wait_image_writer()
+
+        has_video_keys = len(self.meta.video_keys) > 0
+        use_streaming = self._streaming_encoder is not None and has_video_keys
+        use_batched_encoding = self.batch_encoding_size > 1
+
+        if use_streaming:
+            # Compute stats for non-video features only (video stats come from encoder)
+            non_video_buffer = {
+                k: v
+                for k, v in episode_buffer.items()
+                if self.features.get(k, {}).get("dtype") not in ("video",)
+            }
+            non_video_features = {k: v for k, v in self.features.items() if v["dtype"] != "video"}
+            ep_stats = compute_episode_stats(non_video_buffer, non_video_features)
+        else:
+            ep_stats = compute_episode_stats(episode_buffer, self.features)
+
+        ep_metadata = self._save_episode_data(episode_buffer)
+
+        if use_streaming:
+            # Finish streaming encoding and collect results
+            streaming_results = self._streaming_encoder.finish_episode()
+            for video_key in self.meta.video_keys:
+                temp_path, video_stats = streaming_results[video_key]
+                if video_stats is not None:
+                    # Format stats same as compute_episode_stats: normalize to [0,1], reshape to (C,1,1)
+                    ep_stats[video_key] = {
+                        k: v if k == "count" else np.squeeze(v.reshape(1, -1, 1, 1) / 255.0, axis=0)
+                        for k, v in video_stats.items()
+                    }
+                ep_metadata.update(self._save_episode_video(video_key, episode_index, temp_path=temp_path))
+        elif has_video_keys and not use_batched_encoding:
+            num_cameras = len(self.meta.video_keys)
+            if parallel_encoding and num_cameras > 1:
+                # TODO(Steven): Ideally we would like to control the number of threads per encoding such that:
+                # num_cameras * num_threads = (total_cpu -1)
+                with concurrent.futures.ProcessPoolExecutor(max_workers=num_cameras) as executor:
+                    future_to_key = {
+                        executor.submit(
+                            _encode_video_worker,
+                            video_key,
+                            episode_index,
+                            self.root,
+                            self.fps,
+                            self.vcodec,
+                            self._encoder_threads,
+                        ): video_key
+                        for video_key in self.meta.video_keys
+                    }
+
+                    results = {}
+                    for future in concurrent.futures.as_completed(future_to_key):
+                        video_key = future_to_key[future]
+                        try:
+                            temp_path = future.result()
+                            results[video_key] = temp_path
+                        except Exception as exc:
+                            logging.error(f"Video encoding failed for {video_key}: {exc}")
+                            raise exc
+
+                for video_key in self.meta.video_keys:
+                    temp_path = results[video_key]
+                    ep_metadata.update(
+                        self._save_episode_video(video_key, episode_index, temp_path=temp_path)
+                    )
+            else:
+                for video_key in self.meta.video_keys:
+                    ep_metadata.update(self._save_episode_video(video_key, episode_index))
+
+        # `meta.save_episode` need to be executed after encoding the videos
+        self.meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats, ep_metadata)
+
+        if has_video_keys and use_batched_encoding:
+            # Check if we should trigger batch encoding
+            self.episodes_since_last_encoding += 1
+            if self.episodes_since_last_encoding == self.batch_encoding_size:
+                start_ep = self.num_episodes - self.batch_encoding_size
+                end_ep = self.num_episodes
+                self._batch_save_episode_video(start_ep, end_ep)
+                self.episodes_since_last_encoding = 0
+
+        if not episode_data:
+            # Reset episode buffer and clean up temporary images (if not already deleted during video encoding)
+            self.clear_episode_buffer(delete_images=len(self.meta.image_keys) > 0)
+
+    def _batch_save_episode_video(self, start_episode: int, end_episode: int | None = None) -> None:
+        """
+        Batch save videos for multiple episodes.
+
+        Args:
+            start_episode: Starting episode index (inclusive)
+            end_episode: Ending episode index (exclusive). If None, encodes all episodes from start_episode to the current episode.
+        """
+        if end_episode is None:
+            end_episode = self.num_episodes
 
         logging.info(
-            f"  Calibration: {num_frames} frames -> {video_size_mb:.2f} MB "
-            f"= {size_per_frame_mb:.4f} MB/frame for {img_key}"
+            f"Batch encoding {self.batch_encoding_size} videos for episodes {start_episode} to {end_episode - 1}"
         )
 
-        return size_per_frame_mb
+        chunk_idx = self.meta.episodes[start_episode]["data/chunk_index"]
+        file_idx = self.meta.episodes[start_episode]["data/file_index"]
+        episode_df_path = self.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
+        episode_df = pd.read_parquet(episode_df_path)
 
-    finally:
-        # Clean up calibration files
-        if calibration_dir.exists():
-            shutil.rmtree(calibration_dir)
+        for ep_idx in range(start_episode, end_episode):
+            logging.info(f"Encoding videos for episode {ep_idx}")
 
+            if (
+                self.meta.episodes[ep_idx]["data/chunk_index"] != chunk_idx
+                or self.meta.episodes[ep_idx]["data/file_index"] != file_idx
+            ):
+                # The current episode is in a new chunk or file.
+                # Save previous episode dataframe and update the Hugging Face dataset by reloading it.
+                episode_df.to_parquet(episode_df_path)
+                self.meta.episodes = load_episodes(self.root)
 
-def _copy_data_without_images(
-    src_dataset: LeRobotDataset,
-    dst_meta: LeRobotDatasetMetadata,
-    episode_indices: list[int],
-    img_keys: list[str],
-) -> None:
-    """Copy data files without image columns.
+                # Load new episode dataframe
+                chunk_idx = self.meta.episodes[ep_idx]["data/chunk_index"]
+                file_idx = self.meta.episodes[ep_idx]["data/file_index"]
+                episode_df_path = self.root / DEFAULT_EPISODES_PATH.format(
+                    chunk_index=chunk_idx, file_index=file_idx
+                )
+                episode_df = pd.read_parquet(episode_df_path)
 
-    Args:
-        src_dataset: Source dataset
-        dst_meta: Destination metadata
-        episode_indices: Episodes to include
-        img_keys: Image keys to remove
-    """
-    from lerobot.datasets.utils import DATA_DIR
+            # Save the current episode's video metadata to the dataframe
+            video_ep_metadata = {}
+            for video_key in self.meta.video_keys:
+                video_ep_metadata.update(self._save_episode_video(video_key, ep_idx))
+            video_ep_metadata.pop("episode_index")
+            video_ep_df = pd.DataFrame(video_ep_metadata, index=[ep_idx]).convert_dtypes(
+                dtype_backend="pyarrow"
+            )  # allows NaN values along with integers
 
-    data_dir = src_dataset.root / DATA_DIR
-    parquet_files = sorted(data_dir.glob("*/*.parquet"))
+            episode_df = episode_df.combine_first(video_ep_df)
+            episode_df.to_parquet(episode_df_path)
+            self.meta.episodes = load_episodes(self.root)
 
-    if not parquet_files:
-        raise ValueError(f"No parquet files found in {data_dir}")
+    def _save_episode_data(self, episode_buffer: dict) -> dict:
+        """Save episode data to a parquet file and update the Hugging Face dataset of frames data.
 
-    episode_set = set(episode_indices)
+        This function processes episodes data from a buffer, converts it into a Hugging Face dataset,
+        and saves it as a parquet file. It handles both the creation of new parquet files and the
+        updating of existing ones based on size constraints. After saving the data, it reloads
+        the Hugging Face dataset to ensure it is up-to-date.
 
-    for src_path in tqdm(parquet_files, desc="Processing data files"):
-        df = pd.read_parquet(src_path).reset_index(drop=True)
+        Notes: We both need to update parquet files and HF dataset:
+        - `pandas` loads parquet file in RAM
+        - `datasets` relies on a memory mapping from pyarrow (no RAM). It either converts parquet files to a pyarrow cache on disk,
+          or loads directly from pyarrow cache.
+        """
+        # Convert buffer into HF Dataset
+        ep_dict = {key: episode_buffer[key] for key in self.hf_features}
+        ep_dataset = datasets.Dataset.from_dict(ep_dict, features=self.hf_features, split="train")
+        ep_dataset = embed_images(ep_dataset)
+        ep_num_frames = len(ep_dataset)
 
-        # Filter to only include selected episodes
-        df = df[df["episode_index"].isin(episode_set)].copy()
+        if self.latest_episode is None:
+            # Initialize indices and frame count for a new dataset made of the first episode data
+            chunk_idx, file_idx = 0, 0
+            global_frame_index = 0
+            self._current_file_start_frame = 0
+            # However, if the episodes already exists
+            # It means we are resuming recording, so we need to load the latest episode
+            # Update the indices to avoid overwriting the latest episode
+            if self.meta.episodes is not None and len(self.meta.episodes) > 0:
+                latest_ep = self.meta.episodes[-1]
+                global_frame_index = latest_ep["dataset_to_index"]
+                chunk_idx = latest_ep["data/chunk_index"]
+                file_idx = latest_ep["data/file_index"]
 
-        if len(df) == 0:
-            continue
-
-        # Remove image columns
-        columns_to_drop = [col for col in img_keys if col in df.columns]
-        if columns_to_drop:
-            df = df.drop(columns=columns_to_drop)
-
-        # Get chunk and file indices from path
-        relative_path = src_path.relative_to(src_dataset.root)
-        chunk_dir = relative_path.parts[1]
-        file_name = relative_path.parts[2]
-        chunk_idx = int(chunk_dir.split("-")[1])
-        file_idx = int(file_name.split("-")[1].split(".")[0])
-
-        # Write to destination without pandas index
-        dst_path = dst_meta.root / f"data/chunk-{chunk_idx:03d}/file-{file_idx:03d}.parquet"
-        dst_path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(dst_path, index=False)
-
-
-# Video conversion constants
-BYTES_PER_KIB = 1024
-BYTES_PER_MIB = BYTES_PER_KIB * BYTES_PER_KIB
-
-
-def modify_tasks(
-    dataset: LeRobotDataset,
-    new_task: str | None = None,
-    episode_tasks: dict[int, str] | None = None,
-) -> LeRobotDataset:
-    """Modify tasks in a LeRobotDataset.
-
-    This function allows you to either:
-    1. Set a single task for the entire dataset (using `new_task`)
-    2. Set specific tasks for specific episodes (using `episode_tasks`)
-
-    You can combine both: `new_task` sets the default, and `episode_tasks` overrides
-    specific episodes.
-
-    The dataset is modified in-place, updating only the task-related files:
-    - meta/tasks.parquet
-    - data/**/*.parquet (task_index column)
-    - meta/episodes/**/*.parquet (tasks column)
-    - meta/info.json (total_tasks)
-
-    Args:
-        dataset: The source LeRobotDataset to modify.
-        new_task: A single task string to apply to all episodes. If None and episode_tasks
-            is also None, raises an error.
-        episode_tasks: Optional dict mapping episode indices to their task strings.
-            Overrides `new_task` for specific episodes.
-
-
-    Examples:
-        Set a single task for all episodes:
-            dataset = modify_tasks(dataset, new_task="Pick up the cube")
-
-        Set different tasks for specific episodes:
-            dataset = modify_tasks(
-                dataset,
-                episode_tasks={0: "Task A", 1: "Task B", 2: "Task A"}
-            )
-
-        Set a default task with overrides:
-            dataset = modify_tasks(
-                dataset,
-                new_task="Default task",
-                episode_tasks={5: "Special task for episode 5"}
-            )
-    """
-    if new_task is None and episode_tasks is None:
-        raise ValueError("Must specify at least one of new_task or episode_tasks")
-
-    if episode_tasks is not None:
-        valid_indices = set(range(dataset.meta.total_episodes))
-        invalid = set(episode_tasks.keys()) - valid_indices
-        if invalid:
-            raise ValueError(f"Invalid episode indices: {invalid}")
-
-    # Ensure episodes metadata is loaded
-    if dataset.meta.episodes is None:
-        dataset.meta.episodes = load_episodes(dataset.root)
-
-    # Build the mapping from episode index to task string
-    episode_to_task: dict[int, str] = {}
-    for ep_idx in range(dataset.meta.total_episodes):
-        if episode_tasks and ep_idx in episode_tasks:
-            episode_to_task[ep_idx] = episode_tasks[ep_idx]
-        elif new_task is not None:
-            episode_to_task[ep_idx] = new_task
+                # When resuming, move to the next file
+                chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, self.meta.chunks_size)
+                self._current_file_start_frame = global_frame_index
         else:
-            # Keep original task if not overridden and no default provided
-            original_tasks = dataset.meta.episodes[ep_idx]["tasks"]
-            if not original_tasks:
-                raise ValueError(f"Episode {ep_idx} has no tasks and no default task was provided")
-            episode_to_task[ep_idx] = original_tasks[0]
+            # Retrieve information from the latest parquet file
+            latest_ep = self.latest_episode
+            chunk_idx = latest_ep["data/chunk_index"]
+            file_idx = latest_ep["data/file_index"]
+            global_frame_index = latest_ep["index"][-1] + 1
 
-    # Collect all unique tasks and create new task mapping
-    unique_tasks = sorted(set(episode_to_task.values()))
-    new_task_df = pd.DataFrame(
-        {"task_index": list(range(len(unique_tasks)))}, index=pd.Index(unique_tasks, name="task")
-    )
-    task_to_index = {task: idx for idx, task in enumerate(unique_tasks)}
+            latest_path = self.root / self.meta.data_path.format(chunk_index=chunk_idx, file_index=file_idx)
+            latest_size_in_mb = get_file_size_in_mb(latest_path)
 
-    logging.info(f"Modifying tasks in {dataset.repo_id}")
-    logging.info(f"New tasks: {unique_tasks}")
+            frames_in_current_file = global_frame_index - self._current_file_start_frame
+            av_size_per_frame = (
+                latest_size_in_mb / frames_in_current_file if frames_in_current_file > 0 else 0
+            )
 
-    root = dataset.root
+            # Determine if a new parquet file is needed
+            if (
+                latest_size_in_mb + av_size_per_frame * ep_num_frames >= self.meta.data_files_size_in_mb
+                or self._writer_closed_for_reading
+            ):
+                # Size limit is reached or writer was closed for reading, prepare new parquet file
+                chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, self.meta.chunks_size)
+                self._close_writer()
+                self._writer_closed_for_reading = False
+                self._current_file_start_frame = global_frame_index
 
-    # Update data files - modify task_index column
-    logging.info("Updating data files...")
-    data_dir = root / DATA_DIR
+        ep_dict["data/chunk_index"] = chunk_idx
+        ep_dict["data/file_index"] = file_idx
 
-    for parquet_path in tqdm(sorted(data_dir.rglob("*.parquet")), desc="Updating data"):
-        df = pd.read_parquet(parquet_path)
+        # Write the resulting dataframe from RAM to disk
+        path = self.root / self.meta.data_path.format(chunk_index=chunk_idx, file_index=file_idx)
+        path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Build a mapping from episode_index to new task_index for rows in this file
-        episode_indices_in_file = df["episode_index"].unique()
-        ep_to_new_task_idx = {
-            ep_idx: task_to_index[episode_to_task[ep_idx]] for ep_idx in episode_indices_in_file
+        table = ep_dataset.with_format("arrow")[:]
+        if not self.writer:
+            self.writer = pq.ParquetWriter(
+                path, schema=table.schema, compression="snappy", use_dictionary=True
+            )
+        self.writer.write_table(table)
+
+        metadata = {
+            "data/chunk_index": chunk_idx,
+            "data/file_index": file_idx,
+            "dataset_from_index": global_frame_index,
+            "dataset_to_index": global_frame_index + ep_num_frames,
         }
 
-        # Update task_index column
-        df["task_index"] = df["episode_index"].map(ep_to_new_task_idx)
-        df.to_parquet(parquet_path, index=False)
+        # Store metadata with episode data for next episode
+        self.latest_episode = {**ep_dict, **metadata}
 
-    # Update episodes metadata - modify tasks column
-    logging.info("Updating episodes metadata...")
-    episodes_dir = root / "meta" / "episodes"
+        # Mark that the HF dataset needs reloading (lazy loading approach)
+        # This avoids expensive reloading during sequential recording
+        self._lazy_loading = True
+        # Update recorded frames count for efficient length tracking
+        self._recorded_frames += ep_num_frames
 
-    for parquet_path in tqdm(sorted(episodes_dir.rglob("*.parquet")), desc="Updating episodes"):
-        df = pd.read_parquet(parquet_path)
+        return metadata
 
-        # Update tasks column
-        df["tasks"] = df["episode_index"].apply(lambda ep_idx: [episode_to_task[ep_idx]])
-        df.to_parquet(parquet_path, index=False)
-
-    # Write new tasks.parquet
-    write_tasks(new_task_df, root)
-
-    # Update info.json
-    dataset.meta.info["total_tasks"] = len(unique_tasks)
-    write_info(dataset.meta.info, root)
-
-    # Reload metadata to reflect changes
-    dataset.meta.tasks = new_task_df
-    dataset.meta.episodes = load_episodes(root)
-
-    logging.info(f"Tasks: {unique_tasks}")
-
-    return dataset
-
-
-def convert_image_to_video_dataset(
-    dataset: LeRobotDataset,
-    output_dir: Path | None = None,
-    repo_id: str | None = None,
-    vcodec: str = "libsvtav1",
-    pix_fmt: str = "yuv420p",
-    g: int = 2,
-    crf: int = 30,
-    fast_decode: int = 0,
-    episode_indices: list[int] | None = None,
-    num_workers: int = 4,
-    max_episodes_per_batch: int | None = None,
-    max_frames_per_batch: int | None = None,
-) -> LeRobotDataset:
-    """Convert image-to-video dataset.
-
-    Creates a new LeRobotDataset with images encoded as videos, following the proper
-    LeRobot dataset structure with videos stored in chunked MP4 files.
-
-    Args:
-        dataset: The source LeRobot dataset with images
-        output_dir: Root directory where the edited dataset will be stored. If not specified, defaults to $HF_LEROBOT_HOME/repo_id. Equivalent to new_root in EditDatasetConfig.
-        repo_id: Edited dataset identifier. Equivalent to new_repo_id in EditDatasetConfig.
-        vcodec: Video codec (default: libsvtav1)
-        pix_fmt: Pixel format (default: yuv420p)
-        g: Group of pictures size (default: 2)
-        crf: Constant rate factor (default: 30)
-        fast_decode: Fast decode tuning (default: 0)
-        episode_indices: List of episode indices to convert (None = all episodes)
-        num_workers: Number of threads for parallel processing (default: 4)
-        max_episodes_per_batch: Maximum episodes per video batch to avoid memory issues (None = no limit)
-        max_frames_per_batch: Maximum frames per video batch to avoid memory issues (None = no limit)
-
-    Returns:
-        New LeRobotDataset with images encoded as videos
-    """
-    # Check that it's an image dataset
-    if len(dataset.meta.video_keys) > 0:
-        raise ValueError(
-            f"This operation is for image datasets only. Video dataset provided: {dataset.repo_id}"
-        )
-
-    # Get all image keys
-    hf_dataset = dataset.hf_dataset.with_format(None)
-    img_keys = [key for key in hf_dataset.features if key.startswith(OBS_IMAGE)]
-
-    if len(img_keys) == 0:
-        raise ValueError(f"No image keys found in dataset {dataset.repo_id}")
-
-    # Determine which episodes to process
-    if episode_indices is None:
-        episode_indices = list(range(dataset.meta.total_episodes))
-
-    if repo_id is None:
-        repo_id = f"{dataset.repo_id}_video"
-
-    logging.info(
-        f"Converting {len(episode_indices)} episodes with {len(img_keys)} cameras from {dataset.repo_id}"
-    )
-    logging.info(f"Video codec: {vcodec}, pixel format: {pix_fmt}, GOP: {g}, CRF: {crf}")
-
-    # Create new features dict, converting image features to video features
-    new_features = {}
-    for key, value in dataset.meta.features.items():
-        if key not in img_keys:
-            new_features[key] = value
+    def _save_episode_video(
+        self,
+        video_key: str,
+        episode_index: int,
+        temp_path: Path | None = None,
+    ) -> dict:
+        # Encode episode frames into a temporary video
+        if temp_path is None:
+            ep_path = self._encode_temporary_episode_video(video_key, episode_index)
         else:
-            # Convert image key to video format
-            new_features[key] = value.copy()
-            new_features[key]["dtype"] = "video"  # Change dtype from "image" to "video"
-            # Video info will be updated after episodes are encoded
+            ep_path = temp_path
 
-    # Create new metadata for video dataset
-    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
-    new_meta = LeRobotDatasetMetadata.create(
-        repo_id=repo_id,
-        fps=dataset.meta.fps,
-        features=new_features,
-        robot_type=dataset.meta.robot_type,
-        root=output_dir,
-        use_videos=True,
-        chunks_size=dataset.meta.chunks_size,
-        data_files_size_in_mb=dataset.meta.data_files_size_in_mb,
-        video_files_size_in_mb=dataset.meta.video_files_size_in_mb,
-    )
+        ep_size_in_mb = get_file_size_in_mb(ep_path)
+        ep_duration_in_s = get_video_duration_in_s(ep_path)
 
-    # Create temporary directory for image extraction
-    temp_dir = output_dir / "temp_images"
-    temp_dir.mkdir(parents=True, exist_ok=True)
+        if (
+            episode_index == 0
+            or self.meta.latest_episode is None
+            or f"videos/{video_key}/chunk_index" not in self.meta.latest_episode
+        ):
+            # Initialize indices for a new dataset made of the first episode data
+            chunk_idx, file_idx = 0, 0
+            if self.meta.episodes is not None and len(self.meta.episodes) > 0:
+                # It means we are resuming recording, so we need to load the latest episode
+                # Update the indices to avoid overwriting the latest episode
+                old_chunk_idx = self.meta.episodes[-1][f"videos/{video_key}/chunk_index"]
+                old_file_idx = self.meta.episodes[-1][f"videos/{video_key}/file_index"]
+                chunk_idx, file_idx = update_chunk_file_indices(
+                    old_chunk_idx, old_file_idx, self.meta.chunks_size
+                )
+            latest_duration_in_s = 0.0
+            new_path = self.root / self.meta.video_path.format(
+                video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
+            )
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(ep_path), str(new_path))
+        else:
+            # Retrieve information from the latest updated video file using latest_episode
+            latest_ep = self.meta.latest_episode
+            chunk_idx = latest_ep[f"videos/{video_key}/chunk_index"][0]
+            file_idx = latest_ep[f"videos/{video_key}/file_index"][0]
 
-    # Process all episodes and batch encode videos
-    # Use dictionary for O(1) episode metadata lookups instead of O(n) linear search
-    all_episode_metadata = {}
-    fps = int(dataset.fps)
+            latest_path = self.root / self.meta.video_path.format(
+                video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
+            )
+            latest_size_in_mb = get_file_size_in_mb(latest_path)
+            latest_duration_in_s = latest_ep[f"videos/{video_key}/to_timestamp"][0]
 
-    try:
-        # Build episode metadata entries first
-        logging.info("Building episode metadata...")
-        cumulative_frame_idx = 0
-        for ep_idx in episode_indices:
-            src_episode = dataset.meta.episodes[ep_idx]
-            ep_length = src_episode["length"]
-            ep_meta = {
-                "episode_index": ep_idx,
-                "length": ep_length,
-                "dataset_from_index": cumulative_frame_idx,
-                "dataset_to_index": cumulative_frame_idx + ep_length,
-            }
-            if "data/chunk_index" in src_episode:
-                ep_meta["data/chunk_index"] = src_episode["data/chunk_index"]
-                ep_meta["data/file_index"] = src_episode["data/file_index"]
-            all_episode_metadata[ep_idx] = ep_meta
-            cumulative_frame_idx += ep_length
+            if latest_size_in_mb + ep_size_in_mb >= self.meta.video_files_size_in_mb:
+                # Move temporary episode video to a new video file in the dataset
+                chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, self.meta.chunks_size)
+                new_path = self.root / self.meta.video_path.format(
+                    video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
+                )
+                new_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(ep_path), str(new_path))
+                latest_duration_in_s = 0.0
+            else:
+                # Update latest video file
+                concatenate_video_files(
+                    [latest_path, ep_path],
+                    latest_path,
+                )
 
-        # Process each camera and batch encode multiple episodes together
-        video_file_size_limit = new_meta.video_files_size_in_mb
+        # Remove temporary directory
+        shutil.rmtree(str(ep_path.parent))
 
-        # Pre-compute episode lengths for batching
-        episode_lengths = {ep_idx: dataset.meta.episodes["length"][ep_idx] for ep_idx in episode_indices}
+        # Update video info (only needed when first episode is encoded since it reads from episode 0)
+        if episode_index == 0:
+            self.meta.update_video_info(video_key)
+            write_info(self.meta.info, self.meta.root)  # ensure video info always written properly
 
-        for img_key in tqdm(img_keys, desc="Processing cameras"):
-            # Estimate size per frame by encoding a small calibration sample
-            # This provides accurate compression ratio for the specific codec parameters
-            size_per_frame_mb = _estimate_frame_size_via_calibration(
-                dataset=dataset,
-                img_key=img_key,
-                episode_indices=episode_indices,
-                temp_dir=temp_dir,
-                fps=fps,
-                vcodec=vcodec,
-                pix_fmt=pix_fmt,
-                g=g,
-                crf=crf,
-                fast_decode=fast_decode,
+        metadata = {
+            "episode_index": episode_index,
+            f"videos/{video_key}/chunk_index": chunk_idx,
+            f"videos/{video_key}/file_index": file_idx,
+            f"videos/{video_key}/from_timestamp": latest_duration_in_s,
+            f"videos/{video_key}/to_timestamp": latest_duration_in_s + ep_duration_in_s,
+        }
+        return metadata
+
+    def clear_episode_buffer(self, delete_images: bool = True) -> None:
+        # Cancel streaming encoder if active
+        if self._streaming_encoder is not None:
+            self._streaming_encoder.cancel_episode()
+
+        # Clean up image files for the current episode buffer
+        if delete_images:
+            # Wait for the async image writer to finish
+            if self.image_writer is not None:
+                self._wait_image_writer()
+            episode_index = self.episode_buffer["episode_index"]
+            if isinstance(episode_index, np.ndarray):
+                episode_index = episode_index.item() if episode_index.size == 1 else episode_index[0]
+            for cam_key in self.meta.image_keys:
+                img_dir = self._get_image_file_dir(episode_index, cam_key)
+                if img_dir.is_dir():
+                    shutil.rmtree(img_dir)
+
+        # Reset the buffer
+        self.episode_buffer = self.create_episode_buffer()
+
+    def start_image_writer(self, num_processes: int = 0, num_threads: int = 4) -> None:
+        if isinstance(self.image_writer, AsyncImageWriter):
+            logging.warning(
+                "You are starting a new AsyncImageWriter that is replacing an already existing one in the dataset."
             )
 
-            logging.info(f"Processing camera: {img_key}")
-            chunk_idx, file_idx = 0, 0
-            cumulative_timestamp = 0.0
+        self.image_writer = AsyncImageWriter(
+            num_processes=num_processes,
+            num_threads=num_threads,
+        )
 
-            # Process episodes in batches to stay under size limit
-            for batch_episodes in _iter_episode_batches(
-                episode_indices=episode_indices,
-                episode_lengths=episode_lengths,
-                size_per_frame_mb=size_per_frame_mb,
-                video_file_size_limit=video_file_size_limit,
-                max_episodes=max_episodes_per_batch,
-                max_frames=max_frames_per_batch,
-            ):
-                total_frames_in_batch = sum(episode_lengths[idx] for idx in batch_episodes)
-                logging.info(
-                    f"  Encoding batch of {len(batch_episodes)} episodes "
-                    f"({batch_episodes[0]}-{batch_episodes[-1]}) = {total_frames_in_batch} frames"
+    def stop_image_writer(self) -> None:
+        """
+        Whenever wrapping this dataset inside a parallelized DataLoader, this needs to be called first to
+        remove the image_writer in order for the LeRobotDataset object to be pickleable and parallelized.
+        """
+        if self.image_writer is not None:
+            self.image_writer.stop()
+            self.image_writer = None
+
+    def _wait_image_writer(self) -> None:
+        """Wait for asynchronous image writer to finish."""
+        if self.image_writer is not None:
+            self.image_writer.wait_until_done()
+
+    def _encode_temporary_episode_video(self, video_key: str, episode_index: int) -> Path:
+        """
+        Use ffmpeg to convert frames stored as png into mp4 videos.
+        Note: `encode_video_frames` is a blocking call. Making it asynchronous shouldn't speedup encoding,
+        since video encoding with ffmpeg is already using multithreading.
+        """
+        return _encode_video_worker(
+            video_key, episode_index, self.root, self.fps, self.vcodec, self._encoder_threads
+        )
+
+    @classmethod
+    def create(
+        cls,
+        repo_id: str,
+        fps: int,
+        features: dict,
+        root: str | Path | None = None,
+        robot_type: str | None = None,
+        use_videos: bool = True,
+        tolerance_s: float = 1e-4,
+        image_writer_processes: int = 0,
+        image_writer_threads: int = 0,
+        video_backend: str | None = None,
+        batch_encoding_size: int = 1,
+        vcodec: str = "libsvtav1",
+        metadata_buffer_size: int = 10,
+        streaming_encoding: bool = False,
+        encoder_queue_maxsize: int = 30,
+        encoder_threads: int | None = None,
+    ) -> "LeRobotDataset":
+        """Create a LeRobot Dataset from scratch in order to record data."""
+        vcodec = resolve_vcodec(vcodec)
+        obj = cls.__new__(cls)
+        obj.meta = LeRobotDatasetMetadata.create(
+            repo_id=repo_id,
+            fps=fps,
+            robot_type=robot_type,
+            features=features,
+            root=root,
+            use_videos=use_videos,
+            metadata_buffer_size=metadata_buffer_size,
+        )
+        obj.repo_id = obj.meta.repo_id
+        obj.root = obj.meta.root
+        obj.revision = None
+        obj.tolerance_s = tolerance_s
+        obj.image_writer = None
+        obj.batch_encoding_size = batch_encoding_size
+        obj.episodes_since_last_encoding = 0
+        obj.vcodec = vcodec
+        obj._encoder_threads = encoder_threads
+
+        if image_writer_processes or image_writer_threads:
+            obj.start_image_writer(image_writer_processes, image_writer_threads)
+
+        # TODO(aliberts, rcadene, alexander-soare): Merge this with OnlineBuffer/DataBuffer
+        obj.episode_buffer = obj.create_episode_buffer()
+
+        obj.episodes = None
+        obj.hf_dataset = obj.create_hf_dataset()
+        obj.image_transforms = None
+        obj.delta_timestamps = None
+        obj.delta_indices = None
+        obj._absolute_to_relative_idx = None
+        obj.video_backend = video_backend if video_backend is not None else get_safe_default_codec()
+        obj.writer = None
+        obj.latest_episode = None
+        obj._current_file_start_frame = None
+        # Initialize tracking for incremental recording
+        obj._lazy_loading = False
+        obj._recorded_frames = 0
+        obj._writer_closed_for_reading = False
+
+        # Initialize streaming encoder
+        if streaming_encoding and len(obj.meta.video_keys) > 0:
+            obj._streaming_encoder = StreamingVideoEncoder(
+                fps=fps,
+                vcodec=vcodec,
+                pix_fmt="yuv420p",
+                g=2,
+                crf=30,
+                preset=None,
+                queue_maxsize=encoder_queue_maxsize,
+                encoder_threads=encoder_threads,
+            )
+        else:
+            obj._streaming_encoder = None
+
+        return obj
+
+
+class MultiLeRobotDataset(torch.utils.data.Dataset):
+    """A dataset consisting of multiple underlying `LeRobotDataset`s.
+
+    The underlying `LeRobotDataset`s are effectively concatenated, and this class adopts much of the API
+    structure of `LeRobotDataset`.
+    """
+
+    def __init__(
+        self,
+        repo_ids: list[str],
+        root: str | Path | None = None,
+        episodes: dict | None = None,
+        image_transforms: Callable | None = None,
+        delta_timestamps: dict[str, list[float]] | None = None,
+        tolerances_s: dict | None = None,
+        download_videos: bool = True,
+        video_backend: str | None = None,
+    ):
+        super().__init__()
+        self.repo_ids = repo_ids
+        self.root = Path(root) if root else HF_LEROBOT_HOME
+        self.tolerances_s = tolerances_s if tolerances_s else dict.fromkeys(repo_ids, 0.0001)
+        # Construct the underlying datasets passing everything but `transform` and `delta_timestamps` which
+        # are handled by this class.
+        self._datasets = [
+            LeRobotDataset(
+                repo_id,
+                root=self.root / repo_id,
+                episodes=episodes[repo_id] if episodes else None,
+                image_transforms=image_transforms,
+                delta_timestamps=delta_timestamps,
+                tolerance_s=self.tolerances_s[repo_id],
+                download_videos=download_videos,
+                video_backend=video_backend,
+            )
+            for repo_id in repo_ids
+        ]
+
+        # Disable any data keys that are not common across all of the datasets. Note: we may relax this
+        # restriction in future iterations of this class. For now, this is necessary at least for being able
+        # to use PyTorch's default DataLoader collate function.
+        self.disabled_features = set()
+        intersection_features = set(self._datasets[0].features)
+        for ds in self._datasets:
+            intersection_features.intersection_update(ds.features)
+        if len(intersection_features) == 0:
+            raise RuntimeError(
+                "Multiple datasets were provided but they had no keys common to all of them. "
+                "The multi-dataset functionality currently only keeps common keys."
+            )
+        for repo_id, ds in zip(self.repo_ids, self._datasets, strict=True):
+            extra_keys = set(ds.features).difference(intersection_features)
+            if extra_keys:
+                logging.warning(
+                    f"keys {extra_keys} of {repo_id} were disabled as they are not contained in all the "
+                    "other datasets."
                 )
+                self.disabled_features.update(extra_keys)
 
-                # Save images for all episodes in this batch
-                imgs_dir = temp_dir / f"batch_{chunk_idx}_{file_idx}" / img_key
-                episode_durations = _save_batch_episodes_images(
-                    dataset=dataset,
-                    imgs_dir=imgs_dir,
-                    img_key=img_key,
-                    episode_indices=batch_episodes,
-                    num_workers=num_workers,
-                )
+        self.image_transforms = image_transforms
+        self.delta_timestamps = delta_timestamps
+        # TODO(rcadene, aliberts): We should not perform this aggregation for datasets
+        # with multiple robots of different ranges. Instead we should have one normalization
+        # per robot.
+        self.stats = aggregate_stats([dataset.meta.stats for dataset in self._datasets])
 
-                # Encode all batched episodes into single video
-                video_path = new_meta.root / new_meta.video_path.format(
-                    video_key=img_key, chunk_index=chunk_idx, file_index=file_idx
-                )
-                video_path.parent.mkdir(parents=True, exist_ok=True)
+    @property
+    def repo_id_to_index(self):
+        """Return a mapping from dataset repo_id to a dataset index automatically created by this class.
 
-                encode_video_frames(
-                    imgs_dir=imgs_dir,
-                    video_path=video_path,
-                    fps=fps,
-                    vcodec=vcodec,
-                    pix_fmt=pix_fmt,
-                    g=g,
-                    crf=crf,
-                    fast_decode=fast_decode,
-                    overwrite=True,
-                )
+        This index is incorporated as a data key in the dictionary returned by `__getitem__`.
+        """
+        return {repo_id: i for i, repo_id in enumerate(self.repo_ids)}
 
-                # Clean up temporary images
-                shutil.rmtree(imgs_dir)
+    @property
+    def fps(self) -> int:
+        """Frames per second used during data collection.
 
-                # Update metadata for each episode in the batch
-                for ep_idx, duration in zip(batch_episodes, episode_durations, strict=True):
-                    from_timestamp = cumulative_timestamp
-                    to_timestamp = cumulative_timestamp + duration
-                    cumulative_timestamp = to_timestamp
+        NOTE: Fow now, this relies on a check in __init__ to make sure all sub-datasets have the same info.
+        """
+        return self._datasets[0].meta.info["fps"]
 
-                    # Find episode metadata entry and add video metadata (O(1) dictionary lookup)
-                    ep_meta = all_episode_metadata[ep_idx]
-                    ep_meta[f"videos/{img_key}/chunk_index"] = chunk_idx
-                    ep_meta[f"videos/{img_key}/file_index"] = file_idx
-                    ep_meta[f"videos/{img_key}/from_timestamp"] = from_timestamp
-                    ep_meta[f"videos/{img_key}/to_timestamp"] = to_timestamp
+    @property
+    def video(self) -> bool:
+        """Returns True if this dataset loads video frames from mp4 files.
 
-                # Move to next video file for next batch
-                chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, new_meta.chunks_size)
-                cumulative_timestamp = 0.0
+        Returns False if it only loads images from png files.
 
-        # Copy and transform data files (removing image columns)
-        _copy_data_without_images(dataset, new_meta, episode_indices, img_keys)
+        NOTE: Fow now, this relies on a check in __init__ to make sure all sub-datasets have the same info.
+        """
+        return self._datasets[0].meta.info.get("video", False)
 
-        # Save episode metadata
-        episodes_df = pd.DataFrame(list(all_episode_metadata.values()))
-        episodes_path = new_meta.root / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
-        episodes_path.parent.mkdir(parents=True, exist_ok=True)
-        episodes_df.to_parquet(episodes_path, index=False)
+    @property
+    def features(self) -> datasets.Features:
+        features = {}
+        for dataset in self._datasets:
+            features.update({k: v for k, v in dataset.hf_features.items() if k not in self.disabled_features})
+        return features
 
-        # Update metadata info
-        new_meta.info["total_episodes"] = len(episode_indices)
-        new_meta.info["total_frames"] = sum(ep["length"] for ep in all_episode_metadata.values())
-        new_meta.info["total_tasks"] = dataset.meta.total_tasks
-        new_meta.info["splits"] = {"train": f"0:{len(episode_indices)}"}
+    @property
+    def camera_keys(self) -> list[str]:
+        """Keys to access image and video stream from cameras."""
+        keys = []
+        for key, feats in self.features.items():
+            if isinstance(feats, (datasets.Image | VideoFrame)):
+                keys.append(key)
+        return keys
 
-        # Update video info for all image keys (now videos)
-        # We need to manually set video info since update_video_info() checks video_keys first
-        for img_key in img_keys:
-            if not new_meta.features[img_key].get("info", None):
-                video_path = new_meta.root / new_meta.video_path.format(
-                    video_key=img_key, chunk_index=0, file_index=0
-                )
-                new_meta.info["features"][img_key]["info"] = get_video_info(video_path)
+    @property
+    def video_frame_keys(self) -> list[str]:
+        """Keys to access video frames that requires to be decoded into images.
 
-        write_info(new_meta.info, new_meta.root)
+        Note: It is empty if the dataset contains images only,
+        or equal to `self.cameras` if the dataset contains videos only,
+        or can even be a subset of `self.cameras` in a case of a mixed image/video dataset.
+        """
+        video_frame_keys = []
+        for key, feats in self.features.items():
+            if isinstance(feats, VideoFrame):
+                video_frame_keys.append(key)
+        return video_frame_keys
 
-        # Copy stats and tasks
-        if dataset.meta.stats is not None:
-            # Remove image stats
-            new_stats = {k: v for k, v in dataset.meta.stats.items() if k not in img_keys}
-            write_stats(new_stats, new_meta.root)
+    @property
+    def num_frames(self) -> int:
+        """Number of samples/frames."""
+        return sum(d.num_frames for d in self._datasets)
 
-        if dataset.meta.tasks is not None:
-            write_tasks(dataset.meta.tasks, new_meta.root)
+    @property
+    def num_episodes(self) -> int:
+        """Number of episodes."""
+        return sum(d.num_episodes for d in self._datasets)
 
-    finally:
-        # Clean up temporary directory
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir)
+    @property
+    def tolerance_s(self) -> float:
+        """Tolerance in seconds used to discard loaded frames when their timestamps
+        are not close enough from the requested frames. It is only used when `delta_timestamps`
+        is provided or when loading video frames from mp4 files.
+        """
+        # 1e-4 to account for possible numerical error
+        return 1 / self.fps - 1e-4
 
-    logging.info(f"Completed converting {dataset.repo_id} to video format")
-    logging.info(f"New dataset saved to: {output_dir}")
+    def __len__(self):
+        return self.num_frames
 
-    # Return new dataset
-    return LeRobotDataset(repo_id=repo_id, root=output_dir)
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        if idx >= len(self):
+            raise IndexError(f"Index {idx} out of bounds.")
+        # Determine which dataset to get an item from based on the index.
+        start_idx = 0
+        dataset_idx = 0
+        for dataset in self._datasets:
+            if idx >= start_idx + dataset.num_frames:
+                start_idx += dataset.num_frames
+                dataset_idx += 1
+                continue
+            break
+        else:
+            raise AssertionError("We expect the loop to break out as long as the index is within bounds.")
+        item = self._datasets[dataset_idx][idx - start_idx]
+        item["dataset_index"] = torch.tensor(dataset_idx)
+        for data_key in self.disabled_features:
+            if data_key in item:
+                del item[data_key]
+
+        return item
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}(\n"
+            f"  Repository IDs: '{self.repo_ids}',\n"
+            f"  Number of Samples: {self.num_frames},\n"
+            f"  Number of Episodes: {self.num_episodes},\n"
+            f"  Type: {'video (.mp4)' if self.video else 'image (.png)'},\n"
+            f"  Recorded Frames per Second: {self.fps},\n"
+            f"  Camera Keys: {self.camera_keys},\n"
+            f"  Video Frame Keys: {self.video_frame_keys if self.video else 'N/A'},\n"
+            f"  Transformations: {self.image_transforms},\n"
+            f")"
+        )

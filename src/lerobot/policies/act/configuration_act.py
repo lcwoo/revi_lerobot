@@ -82,9 +82,10 @@ class ACTConfig(PreTrainedConfig):
     """
 
     # Input / output structure.
+    # Defaults aligned with DemoSpeedup/robobase (action_sequence=25, execution_length=1) for realworld consistency.
     n_obs_steps: int = 1
-    chunk_size: int = 100
-    n_action_steps: int = 100
+    chunk_size: int = 15
+    n_action_steps: int = 1
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -116,15 +117,15 @@ class ACTConfig(PreTrainedConfig):
     n_vae_encoder_layers: int = 4
 
     # Inference.
-    # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
-    temporal_ensemble_coeff: float | None = None
+    # Default 0.01 matches DemoSpeedup temporal_ensemble_gain for realworld consistency.
+    temporal_ensemble_coeff: float | None = 0.01
 
     # Training and loss computation.
     dropout: float = 0.1
     kl_weight: float = 10.0
 
-    # Training preset
-    optimizer_lr: float = 1e-5
+    # Training preset (lr/lr_backbone aligned with DemoSpeedup act.yaml for realworld consistency).
+    optimizer_lr: float = 1e-4
     optimizer_weight_decay: float = 1e-4
     optimizer_lr_backbone: float = 1e-5
 

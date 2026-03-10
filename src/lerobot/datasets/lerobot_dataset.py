@@ -104,7 +104,14 @@ class LeRobotDatasetMetadata:
             if force_cache_sync:
                 raise FileNotFoundError
             self.load_metadata()
-        except (FileNotFoundError, NotADirectoryError):
+        except (FileNotFoundError, NotADirectoryError) as e:
+            # Local-only dataset: when root was explicitly provided, do not call Hub.
+            if root is not None:
+                raise FileNotFoundError(
+                    f"Missing metadata under {self.root}. "
+                    "Create meta/tasks.parquet (and meta/tasks.jsonl for older LeRobot). "
+                    "Example: python ensure_lerobot_meta.py <repo_id_or_path>"
+                ) from e
             if is_valid_version(self.revision):
                 self.revision = get_safe_version(self.repo_id, self.revision)
 
@@ -515,7 +522,7 @@ class LeRobotDatasetMetadata:
         obj.repo_id = repo_id
         obj.root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
 
-        obj.root.mkdir(parents=True, exist_ok=False)
+        obj.root.mkdir(parents=True, exist_ok=True)
 
         features = {**features, **DEFAULT_FEATURES}
         _validate_feature_names(features)
@@ -747,7 +754,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
             # Check if cached dataset contains all requested episodes
             if not self._check_cached_episodes_sufficient():
                 raise FileNotFoundError("Cached dataset doesn't contain all requested episodes")
-        except (FileNotFoundError, NotADirectoryError):
+        except (FileNotFoundError, NotADirectoryError) as e:
+            if root is not None:
+                raise FileNotFoundError(
+                    f"Local dataset under {self.root} is missing data or meta. "
+                    "Ensure meta/ (e.g. tasks.parquet or tasks.jsonl) and data/ exist."
+                ) from e
             if is_valid_version(self.revision):
                 self.revision = get_safe_version(self.repo_id, self.revision)
             self.download(download_videos)

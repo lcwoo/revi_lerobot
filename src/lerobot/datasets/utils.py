@@ -17,6 +17,7 @@ import contextlib
 import importlib.resources
 import json
 import logging
+import shutil
 from collections import deque
 from collections.abc import Iterable, Iterator
 from pathlib import Path
@@ -28,6 +29,7 @@ import numpy as np
 import packaging.version
 import pandas
 import pandas as pd
+import pyarrow as pa
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import torch
@@ -44,7 +46,7 @@ from lerobot.datasets.backward_compatibility import (
     BackwardCompatibilityError,
     ForwardCompatibilityError,
 )
-from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STR
+from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_ENV_STATE, OBS_STR
 from lerobot.utils.utils import SuppressProgressBars, is_valid_numpy_dtype_string
 
 DEFAULT_CHUNK_SIZE = 1000  # Max number of files per chunk
@@ -380,6 +382,77 @@ def load_episodes(local_dir: Path) -> datasets.Dataset:
     # This is to speedup access to these data, instead of having to load episode stats.
     episodes = episodes.select_columns([key for key in episodes.features if not key.startswith("stats/")])
     return episodes
+
+
+def add_features(
+    dataset: Any,
+    features: dict[str, tuple[np.ndarray, dict[str, Any]]],
+    output_dir: Path | None = None,
+    repo_id: str | None = None,
+) -> None:
+    """Add new feature column(s) to a LeRobot dataset and write to a new directory.
+
+    Args:
+        dataset: LeRobotDataset (or object with .root and .meta.info).
+        features: Dict of feature_name -> (array, schema). array is 1D per-frame, schema has
+            "dtype", "shape", "names" (e.g. {"dtype": "float32", "shape": [1], "names": None}).
+        output_dir: Output root directory. If None, uses HF_LEROBOT_HOME / repo_id.
+        repo_id: Output repo id (used when output_dir is None).
+    """
+    root = Path(dataset.root)
+    if output_dir is None:
+        if repo_id is None:
+            raise ValueError("Either output_dir or repo_id must be provided.")
+        output_dir = HF_LEROBOT_HOME / repo_id
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    info = load_info(root)
+    for name, (arr, schema) in features.items():
+        if name in info["features"]:
+            raise ValueError(f"Feature '{name}' already exists in dataset.")
+        info["features"][name] = {**schema, "shape": list(schema["shape"])}
+
+    # Copy meta directory (then overwrite info.json with updated features)
+    (output_dir / "meta").mkdir(parents=True, exist_ok=True)
+    if (root / "meta").exists():
+        for item in (root / "meta").iterdir():
+            dst = output_dir / "meta" / item.name
+            if item.is_dir():
+                shutil.copytree(item, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, dst)
+    write_info(info, output_dir)
+
+    # Copy videos and images if present
+    for subdir in ["videos", "images"]:
+        src = root / subdir
+        if src.exists():
+            shutil.copytree(src, output_dir / subdir, dirs_exist_ok=True)
+
+    # Data: read each parquet, add column(s), write to output
+    data_paths = sorted((root / DATA_DIR).glob("chunk-*/*.parquet"))
+    if not data_paths:
+        raise FileNotFoundError(f"No parquet files under {root / DATA_DIR}")
+
+    cursor = 0
+    for path in data_paths:
+        table = pq.read_table(path)
+        n = table.num_rows
+        for name, (arr, schema) in features.items():
+            chunk = np.asarray(arr[cursor : cursor + n], dtype=schema["dtype"])
+            # PyArrow accepts 1D arrays; flatten if needed (schema "shape" is per-row)
+            if chunk.ndim > 1:
+                chunk = chunk.reshape(-1)
+            table = table.append_column(name, pa.array(chunk))
+        out_path = output_dir / path.relative_to(root)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(table, out_path)
+        cursor += n
+
+    total_frames = len(next(iter(features.values()))[0])
+    if cursor != total_frames:
+        raise ValueError(f"Data parquet total rows ({cursor}) != feature length ({total_frames}).")
 
 
 def load_image_as_numpy(

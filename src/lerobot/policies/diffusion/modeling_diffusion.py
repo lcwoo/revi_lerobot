@@ -44,6 +44,49 @@ from lerobot.policies.utils import (
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 
+def _center_crop_to_shape(x: Tensor, target_h: int, target_w: int) -> Tensor:
+    """Center-crop image tensor to (target_h, target_w). Handles 4D (B, C, H, W) and 5D (B, S, C, H, W).
+    No aspect-ratio distortion; only takes the center region.
+    """
+    h, w = x.shape[-2], x.shape[-1]
+    if h == target_h and w == target_w:
+        return x
+    if h < target_h or w < target_w:
+        raise ValueError(
+            f"Crop target ({target_h}, {target_w}) must not exceed image size ({h}, {w}). "
+            "Use a smaller crop_shape or ensure all camera images are at least crop_shape."
+        )
+    start_h = (h - target_h) // 2
+    start_w = (w - target_w) // 2
+    if x.ndim == 4:
+        return x[..., start_h : start_h + target_h, start_w : start_w + target_w].clone()
+    if x.ndim == 5:
+        return x[..., start_h : start_h + target_h, start_w : start_w + target_w].clone()
+    raise ValueError(f"Expected 4D or 5D image tensor, got ndim={x.ndim}")
+
+
+def _prepare_obs_images_for_stack(
+    batch: dict[str, Tensor],
+    image_feature_keys: list[str],
+    crop_shape: tuple[int, int] | None,
+) -> None:
+    """Center-crop all image features to a common (H, W) in-place so they can be stacked.
+
+    Target size is crop_shape if set; otherwise the minimum H and W across cameras (so we only
+    crop, never need to pad/upscale). Cropping avoids aspect-ratio distortion that resize would cause.
+    """
+    if not image_feature_keys:
+        return
+    if crop_shape is not None:
+        target_h, target_w = crop_shape
+    else:
+        target_h = min(batch[key].shape[-2] for key in image_feature_keys)
+        target_w = min(batch[key].shape[-1] for key in image_feature_keys)
+    for key in image_feature_keys:
+        if batch[key].shape[-2] != target_h or batch[key].shape[-1] != target_w:
+            batch[key] = _center_crop_to_shape(batch[key], target_h, target_w)
+
+
 class DiffusionPolicy(PreTrainedPolicy):
     """
     Diffusion Policy as per "Diffusion Policy: Visuomotor Policy Learning via Action Diffusion"
@@ -127,7 +170,9 @@ class DiffusionPolicy(PreTrainedPolicy):
 
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+            image_keys = list(self.config.image_features)
+            _prepare_obs_images_for_stack(batch, image_keys, self.config.crop_shape)
+            batch[OBS_IMAGES] = torch.stack([batch[key] for key in image_keys], dim=-4)
         # NOTE: It's important that this happens after stacking the images into a single key.
         self._queues = populate_queues(self._queues, batch)
 
@@ -145,7 +190,9 @@ class DiffusionPolicy(PreTrainedPolicy):
             for key in self.config.image_features:
                 if self.config.n_obs_steps == 1 and batch[key].ndim == 4:
                     batch[key] = batch[key].unsqueeze(1)
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+            image_keys = list(self.config.image_features)
+            _prepare_obs_images_for_stack(batch, image_keys, self.config.crop_shape)
+            batch[OBS_IMAGES] = torch.stack([batch[key] for key in image_keys], dim=-4)
         loss = self.diffusion.compute_loss(batch)
         # no output_dict so returning None
         return loss, None
@@ -492,9 +539,9 @@ class DiffusionRgbEncoder(nn.Module):
         # Set up pooling and final layers.
         # Use a dry run to get the feature map shape.
         # The dummy shape mirrors the runtime preprocessing order: resize -> crop.
-
-        # Note: we have a check in the config class to make sure all images have the same shape.
-        images_shape = next(iter(config.image_features.values())).shape
+        # When cameras have different shapes, runtime resizes all to resize_shape or first camera's shape.
+        first_key = next(iter(config.image_features))
+        images_shape = config.image_features[first_key].shape
         if config.crop_shape is not None:
             dummy_shape_h_w = config.crop_shape
         elif config.resize_shape is not None:

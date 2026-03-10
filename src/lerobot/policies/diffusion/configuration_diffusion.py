@@ -39,7 +39,8 @@ class DiffusionConfig(PreTrainedConfig):
               AND/OR
             - The key "observation.environment_state" is required as input.
         - If there are multiple keys beginning with "observation.image" they are treated as multiple camera
-          views. Right now we only support all images having the same shape.
+          views. Camera images may have different (H, W); they are center-cropped to a common shape before
+          stacking (see crop_shape, or the minimum H/W across cameras when crop_shape is None).
         - "action" is required as an output key.
 
     Args:
@@ -101,9 +102,10 @@ class DiffusionConfig(PreTrainedConfig):
     """
 
     # Inputs / output structure.
-    n_obs_steps: int = 2
-    horizon: int = 16
-    n_action_steps: int = 8
+    # Defaults aligned with DemoSpeedup/robobase dp_pixel_bigym (action_sequence=24, execution_length=24) for realworld consistency.
+    n_obs_steps: int = 1
+    horizon: int = 12
+    n_action_steps: int = 12
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -113,29 +115,28 @@ class DiffusionConfig(PreTrainedConfig):
         }
     )
 
-    # The original implementation doesn't sample frames for the last 7 steps,
-    # which avoids excessive padding and leads to improved training results.
-    drop_n_last_frames: int = 7  # horizon - n_action_steps - n_obs_steps + 1
+    # When horizon == n_action_steps (DemoSpeedup style), no frames dropped. Formula: horizon - n_action_steps - n_obs_steps + 1.
+    drop_n_last_frames: int = 0
 
     # Architecture / modeling.
     # Vision backbone.
     vision_backbone: str = "resnet18"
     resize_shape: tuple[int, int] | None = None
     crop_ratio: float = 1.0
-    crop_shape: tuple[int, int] | None = None
+    crop_shape: tuple[int, int] | None = (240, 320)
     crop_is_random: bool = True
     pretrained_backbone_weights: str | None = None
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
-    # Unet.
-    down_dims: tuple[int, ...] = (512, 1024, 2048)
+    # Unet (down_dims and diffusion_step_embed_dim aligned with DemoSpeedup diffusion.yaml for realworld consistency).
+    down_dims: tuple[int, ...] = (256, 512, 1024)
     kernel_size: int = 5
     n_groups: int = 8
-    diffusion_step_embed_dim: int = 128
+    diffusion_step_embed_dim: int = 256
     use_film_scale_modulation: bool = True
-    # Noise scheduler.
-    noise_scheduler_type: str = "DDPM"
+    # Noise scheduler (num_train_timesteps matches DemoSpeedup num_diffusion_iters: 100).
+    noise_scheduler_type: str = "DDIM"
     num_train_timesteps: int = 100
     beta_schedule: str = "squaredcos_cap_v2"
     beta_start: float = 0.0001
@@ -145,7 +146,7 @@ class DiffusionConfig(PreTrainedConfig):
     clip_sample_range: float = 1.0
 
     # Inference
-    num_inference_steps: int | None = None
+    num_inference_steps: int | None = 10
 
     # Optimization
     compile_model: bool = False
@@ -154,7 +155,7 @@ class DiffusionConfig(PreTrainedConfig):
     # Loss computation
     do_mask_loss_for_padding: bool = False
 
-    # Training presets
+    # Training presets (lr aligned with DemoSpeedup diffusion.yaml for realworld consistency).
     optimizer_lr: float = 1e-4
     optimizer_betas: tuple = (0.95, 0.999)
     optimizer_eps: float = 1e-8
@@ -237,14 +238,8 @@ class DiffusionConfig(PreTrainedConfig):
                         f"for `crop_shape` and {image_ft.shape} for `{key}`."
                     )
 
-        # Check that all input images have the same shape.
-        if len(self.image_features) > 0:
-            first_image_key, first_image_ft = next(iter(self.image_features.items()))
-            for key, image_ft in self.image_features.items():
-                if image_ft.shape != first_image_ft.shape:
-                    raise ValueError(
-                        f"`{key}` does not match `{first_image_key}`, but we expect all image shapes to match."
-                    )
+        # Allow different image shapes across cameras; at runtime they are resized to a common shape
+        # (resize_shape if set, otherwise the first camera's shape) before stacking.
 
     @property
     def observation_delta_indices(self) -> list:

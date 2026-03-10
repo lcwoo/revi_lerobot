@@ -165,6 +165,7 @@ import draccus
 from lerobot.configs import parser
 from lerobot.datasets.dataset_tools import (
     convert_image_to_video_dataset,
+    convert_video_to_image_dataset,
     delete_episodes,
     merge_datasets,
     modify_tasks,
@@ -228,6 +229,14 @@ class ConvertImageToVideoConfig(OperationConfig):
     num_workers: int = 4
     max_episodes_per_batch: int | None = None
     max_frames_per_batch: int | None = None
+
+
+@OperationConfig.register_subclass("convert_video_to_image")
+@dataclass
+class ConvertVideoToImageConfig(OperationConfig):
+    episode_indices: list[int] | None = None
+    video_backend: str | None = None
+    tolerance_s: float = 1e-4
 
 
 @OperationConfig.register_subclass("info")
@@ -525,6 +534,40 @@ def handle_convert_image_to_video(cfg: EditDatasetConfig) -> None:
         logging.info("Dataset saved locally (not pushed to hub)")
 
 
+def handle_convert_video_to_image(cfg: EditDatasetConfig) -> None:
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+
+    if cfg.new_root:
+        output_dir = Path(cfg.new_root)
+        output_repo_id = cfg.new_repo_id or f"{cfg.repo_id}_images"
+    elif cfg.new_repo_id:
+        output_repo_id = cfg.new_repo_id
+        output_dir = HF_LEROBOT_HOME / cfg.new_repo_id
+    else:
+        output_repo_id = f"{cfg.repo_id}_images"
+        output_dir = HF_LEROBOT_HOME / output_repo_id
+
+    logging.info(f"Converting video dataset to images: {cfg.repo_id} -> {output_repo_id}")
+
+    new_dataset = convert_video_to_image_dataset(
+        dataset=dataset,
+        output_dir=output_dir,
+        repo_id=output_repo_id,
+        episode_indices=getattr(cfg.operation, "episode_indices", None),
+        video_backend=getattr(cfg.operation, "video_backend", None),
+        tolerance_s=getattr(cfg.operation, "tolerance_s", 1e-4),
+    )
+
+    logging.info("Image dataset created successfully!")
+    logging.info(f"Location: {output_dir}")
+    logging.info(f"Episodes: {new_dataset.meta.total_episodes}, Frames: {new_dataset.meta.total_frames}")
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {output_repo_id}...")
+        new_dataset.push_to_hub()
+        logging.info("✓ Successfully pushed to hub!")
+
+
 def _get_dataset_size(repo_path):
     import os
 
@@ -596,6 +639,8 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
         handle_modify_tasks(cfg)
     elif operation_type == "convert_image_to_video":
         handle_convert_image_to_video(cfg)
+    elif operation_type == "convert_video_to_image":
+        handle_convert_video_to_image(cfg)
     elif operation_type == "info":
         handle_info(cfg)
     else:

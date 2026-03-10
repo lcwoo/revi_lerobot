@@ -1,0 +1,269 @@
+# LeRobot: ACT / Diffusion Policy 학습 방법
+
+## 사전 준비
+
+```bash
+source .venv/bin/activate
+pip install -e .   # 아직 안 했다면
+```
+
+- 데이터셋: LeRobotDataset 형식. `J-joon/habilis_alpha_shirt` 사용 시 아래처럼 환경 변수 설정.
+- GPU 2번만 쓰려면: `export CUDA_VISIBLE_DEVICES=2`
+- Offline( Hub 업로드 없음 ): `--policy.push_to_hub=false`
+
+```bash
+export HF_LEROBOT_HOME=/shared/datasets
+export CUDA_VISIBLE_DEVICES=2
+```
+
+---
+
+## 1. ACT 학습 – 실행할 명령
+
+**아래 한 번에 복사해서 실행하면 됨.**
+
+```bash
+export HF_LEROBOT_HOME=/shared/datasets
+export CUDA_VISIBLE_DEVICES=2
+
+lerobot-train \
+  --policy.type=act \
+  --dataset.repo_id=J-joon/habilis_alpha_shirt \
+  --output_dir=outputs/train/act_habilis_alpha_shirt \
+  --job_name=act_habilis_alpha_shirt \
+  --batch_size=256 \
+  --policy.push_to_hub=false \
+  --wandb.enable=false
+```
+
+- 정책 기본값(chunk_size=25, n_action_steps=1, temporal_ensemble, lr 등)은 **DemoSpeedup/realworld와 동일**하게 `configuration_act.py`에 이미 맞춰져 있음.
+- 배치만 DemoSpeedup처럼 256으로 쓰려면 `--batch_size=256` 유지. GPU 메모리 부족하면 `--batch_size=128` 등으로 줄이면 됨.
+
+**이미지 데이터셋으로 학습 (비디오→이미지 변환본 사용, batch_size=16):**
+
+```bash
+export HF_LEROBOT_HOME=/shared/datasets
+export CUDA_VISIBLE_DEVICES=2
+
+lerobot-train \
+  --policy.type=act \
+  --dataset.repo_id=J-joon/habilis_alpha_shirt_images \
+  --dataset.root=/shared/datasets/J-joon/habilis_alpha_shirt_images \
+  --output_dir=outputs/train/act_habilis_alpha_shirt \
+  --job_name=act_habilis_alpha_shirt \
+  --batch_size=16 \
+  --steps=100000 \
+  --save_freq=20000 \
+  --policy.push_to_hub=false \
+  --wandb.enable=false
+```
+
+- `--dataset.root` 로 이미지 데이터셋 경로 지정. 배치 16은 GPU 메모리 절약용.
+
+**재개:**
+
+```bash
+lerobot-train \
+  --config_path=outputs/train/act_habilis_alpha_shirt/checkpoints/last/pretrained_model/train_config.json \
+  --resume=true
+```
+
+---
+
+## 2. Diffusion Policy 학습 – 실행할 명령
+
+**아래 한 번에 복사해서 실행하면 됨.**
+
+```bash
+export HF_LEROBOT_HOME=/shared/datasets
+export CUDA_VISIBLE_DEVICES=2
+
+lerobot-train \
+  --policy.type=diffusion \
+  --dataset.repo_id=J-joon/habilis_alpha_shirt \
+  --output_dir=outputs/train/diffusion_habilis_alpha_shirt \
+  --job_name=diffusion_habilis_alpha_shirt \
+  --batch_size=256 \
+  --policy.push_to_hub=false \
+  --wandb.enable=false
+```
+
+- 정책 기본값(horizon=24, n_action_steps=24, down_dims, diffusion_step_embed_dim, num_train_timesteps 등)은 **DemoSpeedup/realworld와 동일**하게 `configuration_diffusion.py`에 맞춰져 있음.
+- 배치 256은 DemoSpeedup dp_pixel_bigym 기준. 메모리 부족하면 `--batch_size=128` 등으로 조절.
+
+**재개:**
+
+```bash
+lerobot-train \
+  --config_path=outputs/train/diffusion_habilis_alpha_shirt/checkpoints/last/pretrained_model/train_config.json \
+  --resume=true
+```
+
+---
+
+## 3. 옵션 정리
+
+| 옵션 | 설명 | 기본값(ACT/Diffusion) |
+|------|------|------------------------|
+| `--batch_size` | 학습 배치 크기 | 8 (train config). realworld 맞추려면 256 |
+| `--steps` | 총 학습 스텝 | 100000 |
+| `--save_freq` | 체크포인트 저장 주기(스텝) | 20000 |
+| `--wandb.enable` | Weights & Biases 로깅 | true. 끄려면 false |
+| `--policy.push_to_hub` | Hub 업로드 여부 | true. offline 이면 false |
+
+데이터셋/출력 경로를 바꾸려면 `--dataset.repo_id`, `--output_dir`, `--job_name` 만 원하는 값으로 바꾸면 됨.
+
+---
+
+## 4. 학습 속도 / 병목
+
+### 지금 어떻게 돌고 있는지
+
+- **Streaming 아님**: `dataset.streaming` 기본값은 `false`. 로컬 디스크의 데이터를 **일반 LeRobotDataset**으로 읽음.
+- **학습은 CUDA**: 모델·옵티마이저는 `accelerator.prepare()`로 GPU에 올라가고, forward/backward는 GPU에서 실행됨. `CUDA_VISIBLE_DEVICES=2`면 2번 GPU 사용.
+- **비디오 디코딩은 CPU**: 매 배치마다 영상 프레임을 디코딩하는 부분은 DataLoader **워커(CPU)**에서만 동작함. (멀티프로세스 워커에서 CUDA 쓰면 오류 나서 GPU 디코딩 미사용.)
+
+### CPU 쪽에서 느려질 수 있는 부분
+
+1. **비디오 디코딩**
+   - `habilis_alpha_shirt`는 **AV1** 코덱 + **캠 3개** (cam_head, cam_wrist_left, cam_wrist_right).  
+   - 배치 하나당 (배치 크기 × 캠 수)만큼 프레임을 디코딩하므로, **가장 흔한 병목**이 여기일 수 있음.
+2. **DataLoader 워커 수**
+   - 기본 `num_workers=4`. CPU 코어가 많으면 이걸 올리면 데이터 준비가 빨라질 수 있음.
+3. **디스크 I/O**
+   - 데이터가 네트워크/느린 디스크에 있으면 I/O 대기로 느려질 수 있음.
+
+### 병목이 어디인지 보는 방법
+
+- `--log_freq=200` 정도로 두고 학습하면, 로그에 **`data_s`**(배치 하나 로딩 시간)와 **`updt_s`**(한 스텝 학습 시간)가 찍힘.
+  - **`data_s`가 `updt_s`보다 크면** → 데이터 로딩(비디오 디코딩 등)이 병목.
+  - **`updt_s`가 훨씬 크면** → GPU 연산이 병목.
+
+### 속도 개선 시도해볼 것
+
+- **DataLoader 워커 늘리기** (CPU 코어 여유 있을 때):
+  ```bash
+  --num_workers=8
+  ```
+- **비디오 백엔드 바꿔보기** (torchcodec이 느리면):
+  ```bash
+  --dataset.video_backend=pyav
+  ```
+- **배치 크기 줄이기**: `--batch_size=128` 등으로 줄이면 배치당 디코딩량이 줄어서 data_s는 줄 수 있음. (대신 스텝 수는 늘어남.)
+- **Streaming**: 데이터가 Hub에만 있고 로컬이 부족한 상황이면 `--dataset.streaming=true`를 쓰는 구성이 있지만, 로컬에 이미 있으면 보통 **streaming 끄고 로컬 로딩**이 더 빠름.
+
+### 사전 처리로 병목 줄이기 (추천 순서)
+
+**초반 1~10 step만 느리다** → warmup/dummy batch로 어느 정도만 완화 가능. **계속 느리다** → 아래처럼 데이터 경로를 바꾸는 게 효과적.
+
+| 순서 | 방법 | 효과 | 부담 |
+|------|------|------|------|
+| 1 | **H.264로 재인코딩** | AV1 대비 디코딩 부담 크게 감소, 구조 유지 | 한 번 ffmpeg로 변환, 디스크 약간 증가 |
+| 2 | **비디오 → 프레임(이미지)으로 풀어두기** | 학습 중 디코딩 거의 제거 | 디스크 많이 사용, 변환 스크립트 필요 |
+| 3 | **num_workers / video_backend** | 워커·디코더만 바꿔서 완화 | 위 1·2보다 효과는 작음 (이미 시도 가능) |
+
+**추천: 1번(H.264 재인코딩)을 먼저 하는 게 좋음.**
+
+- 디스크가 넉넉하고 학습을 여러 번 돌릴 예정이면 **2번(비디오→이미지)** 를 한 번 해 두면 이후 학습마다 병목이 크게 줄어든다. LeRobot에 **video → image** 변환 도구가 있음 (아래 2) 참고).
+
+**1) H.264로 재인코딩 (한 번만 하면 됨)**
+
+- 데이터셋 비디오가 AV1이면, 같은 구조로 **H.264**로 다시 인코딩해 두면 학습 시 CPU 디코딩이 훨씬 가벼워짐.
+- 예: 원본 비디오 디렉터리를 백업해 둔 뒤, `videos/` 아래 각 MP4에 대해 ffmpeg로 H.264 재인코딩해서 **같은 경로에 덮어쓰거나**, 새 데이터셋 디렉터리를 만들어 그쪽을 `--dataset.repo_id` / `root`로 지정.
+- ffmpeg 예시 (파일 하나):
+  ```bash
+  ffmpeg -i input_av1.mp4 -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p output_h264.mp4
+  ```
+- 전체 데이터셋에 대해서는 `videos/` 아래 모든 MP4를 순회하는 작은 스크립트로 돌리거나, LeRobot의 `lerobot-edit-dataset` 등으로 “동일 구조 + 다른 코덱” 변환 로직을 붙일 수 있음. (현재 코드베이스에는 “동일 구조 H.264 재인코딩” 한 번에 하는 명령은 없음.)
+- 재인코딩 후에는 **기존과 같은 repo_id/root**를 쓰면 되고, LeRobot 디코더는 파일 헤더 보고 코덱을 쓰므로 `meta/info.json`의 `video.codec`을 바꿀 필요는 없음 (선택).
+
+**2) 비디오 → 프레임(이미지)으로 풀어두기**
+
+- 학습 시에는 **이미지(dtype=image)** 데이터셋이면 MP4 디코딩 없이 PNG에서 바로 읽어서 병목이 거의 사라짐.
+- **CLI로 한 번에 변환:**
+  ```bash
+  export HF_LEROBOT_HOME=/shared/datasets
+
+  lerobot-edit-dataset \
+    --repo_id=J-joon/habilis_alpha_shirt \
+    --operation.type=convert_video_to_image \
+    --new_repo_id=J-joon/habilis_alpha_shirt_images
+  ```
+  - 결과는 `$HF_LEROBOT_HOME/J-joon/habilis_alpha_shirt_images` 에 저장됨.
+  - 학습할 때는 `--dataset.repo_id=J-joon/habilis_alpha_shirt_images` 로 지정하면 됨.
+- **Python에서 직접 호출:**
+  ```python
+  from pathlib import Path
+  from lerobot.datasets.lerobot_dataset import LeRobotDataset
+  from lerobot.datasets.dataset_tools import convert_video_to_image_dataset
+
+  ds = LeRobotDataset("J-joon/habilis_alpha_shirt", root=Path("/shared/datasets"))
+  new_ds = convert_video_to_image_dataset(
+      ds,
+      output_dir=Path("/shared/datasets/J-joon/habilis_alpha_shirt_images"),
+      repo_id="J-joon/habilis_alpha_shirt_images",
+  )
+  ```
+- 디스크 사용량이 커지므로, 여유가 있을 때 사용하는 것이 좋음.
+
+**3) 인덱스/메타는 이미 정리됨**
+
+- “어느 frame을 뽑을지, 어떤 timestep을 쓸지” 같은 건 policy의 `delta_indices` / `delta_timestamps`로 데이터셋 init 시 한 번 계산되고, 매 step마다 다시 계산하지 않음. 그래서 **resize/crop/sample 인덱스 미리 계산**은 이미 되어 있는 편이라, 추가로 할 일은 적음.
+
+**정리:**  
+- **지속적으로 느리면** → **1번(H.264 재인코딩)** 먼저 적용하는 걸 추천.  
+- 디스크 여유와 반복 학습이 많으면 **2번(프레임 풀기)** 를 한 번 구현해 두면 이후 학습마다 병목을 크게 줄일 수 있음.
+
+---
+
+## 5. DemoSpeedup 스타일: proxy → entropy 라벨링 → 그 다음에 무엇을 하나
+
+### DemoSpeedup에서의 전체 흐름
+
+1. **Proxy policy 학습**  
+   전체 데모로 ACT(또는 DP)를 한 번 학습한다. (우리: `lerobot-train` → `act_habilis_alpha_shirt` 체크포인트)
+
+2. **Entropy 라벨링 (label.py)**  
+   - Proxy로 데모를 한 번씩 돌리며, 매 타임스텝마다 MC 샘플 → **KDE entropy** → `demo_entropy`
+   - 같은 샘플들로 **teacher_action** (지수 가중 평균) 계산
+   - entropy에 **HDBSCAN** 클러스터링 적용 → **labels** (0=keyframe, 1=non-key 등)
+   - 저장: `labels_{ep}.npy`, `teacher_actions_{ep}.npy`
+
+3. **Speedup 학습 (speedup=True)**  
+   - 위 labels·teacher_actions를 로드
+   - Replay에 데모를 넣을 때 **downsample_action_with_labels** 로 액션 시퀀스를 “압축” (keyframe 위주로만 골라 chunk 구성)
+   - 이 “가속된” 데모로 다시 ACT/DP를 학습 → **더 짧은 step 수**로 같은 작업 수행
+
+### 우리가 이미 한 것
+
+- **1, 2의 “entropy 계산”까지**  
+  - `compute_demo_dentropy_act.py` (또는 `compute_demo_dentropy_diffusion.py`) 실행  
+  - 결과: **`J-joon/habilis_alpha_shirt_dentropy_act`** 같은 데이터셋에 **`demo_dentropy`** feature가 프레임별로 들어 있음.
+
+예시 (ACT proxy):
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python -m lerobot.datasets.compute_demo_dentropy_act \
+  --policy_ckpt=outputs/train/act_habilis_alpha_shirt/checkpoints/last/pretrained_model \
+  --dataset_repo_id=J-joon/habilis_alpha_shirt \
+  --dataset_root=/shared/datasets/J-joon/habilis_alpha_shirt \
+  --output_repo_id=J-joon/habilis_alpha_shirt_dentropy_act \
+  --num_mc_samples=50 \
+  --batch_size=16
+```
+
+### 결과(demo_dentropy)를 가지고 DemoSpeedup처럼 하려면
+
+- **선택 1: HDBSCAN → labels + teacher_actions**  
+  - `demo_dentropy`를 에피소드별로 모아서 DemoSpeedup의 `hdbscan_with_custom_merge`처럼 클러스터링 → **labels** (0/1 등)  
+  - Proxy를 다시 한 번 돌려서 타임스텝별 **teacher_actions** (지수 가중 평균) 계산  
+  - 이걸 `.npy`로 저장하거나, LeRobot 데이터셋에 `label`, `teacher_action` feature로 넣을 수 있음.
+
+- **선택 2: Speedup 학습**  
+  - DemoSpeedup은 **downsample_action_with_labels** 로 “keyframe만 남긴” 액션 시퀀스로 학습한다.  
+  - LeRobot에는 아직 `speedup=True` 같은 옵션이 없으므로, 다음 중 하나가 필요하다:
+    - **(a)** `demo_dentropy`(또는 labels)로 **keyframe만 필터링한 데이터셋**을 새로 만들고, 그 데이터셋으로 `lerobot-train` 실행  
+    - **(b)** DataLoader/손실에서 **high-entropy 프레임을 downweight** (예: loss에 1/entropy 가중치)  
+    - **(c)** DemoSpeedup의 `downsample_action_with_labels` 로 “압축된” 액션 시퀀스를 만든 **새 데이터셋**을 구성한 뒤, 그걸로 일반 학습
+
+정리하면, **지금 나온 결과는 “entropy까지 붙인 데이터셋”**이고, DemoSpeedup과 동일하게 쓰려면 **그 위에 HDBSCAN → labels/teacher_actions → (선택) speedup용 데이터셋/학습**을 한 단계씩 더 붙이면 된다.

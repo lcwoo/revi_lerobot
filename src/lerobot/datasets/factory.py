@@ -25,6 +25,7 @@ from lerobot.datasets.lerobot_dataset import (
     LeRobotDatasetMetadata,
     MultiLeRobotDataset,
 )
+from lerobot.datasets.speedup import SpeedupDatasetWrapper
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
 from lerobot.datasets.transforms import ImageTransforms
 from lerobot.utils.constants import ACTION, OBS_PREFIX, REWARD
@@ -129,5 +130,21 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         for key in dataset.meta.camera_keys:
             for stats_type, stats in IMAGENET_STATS.items():
                 dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+
+    # DemoSpeedup: wrap with entropy-guided downsampling when enabled
+    if getattr(cfg.dataset, "speedup", False):
+        if cfg.dataset.streaming:
+            raise NotImplementedError("Speedup is not supported with dataset.streaming=True.")
+        dataset = SpeedupDatasetWrapper(
+            dataset,
+            label_key=cfg.dataset.speedup_label_key,
+            low_v=cfg.dataset.downsample_low_v,
+            high_v=cfg.dataset.downsample_high_v,
+        )
+        logging.info(
+            f"DemoSpeedup enabled: downsample_low_v={cfg.dataset.downsample_low_v}, "
+            f"downsample_high_v={cfg.dataset.downsample_high_v}, "
+            f"frames {dataset._base.num_frames} -> {len(dataset)}"
+        )
 
     return dataset

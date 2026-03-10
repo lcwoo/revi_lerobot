@@ -36,6 +36,12 @@ class DatasetConfig:
     video_backend: str = field(default_factory=get_safe_default_codec)
     streaming: bool = False
 
+    # DemoSpeedup: entropy-guided demonstration downsampling (requires demo_dentropy feature)
+    speedup: bool = False
+    downsample_low_v: int = 2  # step size in high-entropy (low confidence) segments
+    downsample_high_v: int = 4  # step size in low-entropy (high confidence) segments
+    speedup_label_key: str = "demo_dentropy"  # feature name for per-frame entropy
+
 
 @dataclass
 class WandBConfig:

@@ -180,11 +180,12 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
     ) -> T:
         model_id = str(pretrained_name_or_path)
         config_file: str | None = None
-        if Path(model_id).is_dir():
-            if CONFIG_NAME in os.listdir(model_id):
-                config_file = os.path.join(model_id, CONFIG_NAME)
+        local_path = Path(model_id).resolve()
+        if local_path.is_dir():
+            if CONFIG_NAME in os.listdir(local_path):
+                config_file = str(local_path / CONFIG_NAME)
             else:
-                logger.error(f"{CONFIG_NAME} not found in {Path(model_id).resolve()}")
+                logger.error(f"{CONFIG_NAME} not found in {local_path}")
         else:
             try:
                 config_file = hf_hub_download(

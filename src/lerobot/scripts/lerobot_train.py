@@ -343,7 +343,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # create dataloader for offline training
-    if hasattr(cfg.policy, "drop_n_last_frames"):
+    # When DemoSpeedup is enabled, the dataset is a SpeedupDatasetWrapper and we must not use
+    # EpisodeAwareSampler (it expects base dataset indices).
+    if hasattr(cfg.policy, "drop_n_last_frames") and not getattr(cfg.dataset, "speedup", False):
         shuffle = False
         sampler = EpisodeAwareSampler(
             dataset.meta.episodes["dataset_from_index"],
