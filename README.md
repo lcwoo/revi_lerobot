@@ -28,9 +28,30 @@
 
 LeRobot can be installed directly from PyPI.
 
+### venv로 환경 설정 (선택)
+
+```bash
+# 가상환경 생성 (Python 3.12 이상 필요)
+python3 -m venv .venv
+
+# 활성화 (Linux/macOS)
+source .venv/bin/activate
+
+# 활성화 (Windows PowerShell)
+# .venv\Scripts\Activate.ps1
+```
+
+### 설치 및 확인
+
 ```bash
 pip install lerobot
 lerobot-info
+```
+
+소스에서 개발용 설치(에디터블):
+
+```bash
+pip install -e .
 ```
 
 > [!IMPORTANT]
@@ -174,3 +195,4 @@ We welcome contributions from everyone in the community! To get started, please 
 <div align="center">
 <sub>Built by the <a href="https://huggingface.co/lerobot">LeRobot</a> team at <a href="https://huggingface.co">Hugging Face</a> with ❤️</sub>
 </div>
+# revi_lerobot
